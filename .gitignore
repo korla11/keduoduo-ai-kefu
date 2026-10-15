@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.log
+.auth_secret_key
+backend.env
+users/*/data/
+users/*/douyin_laike_state.json
+users/*/laike_*.json
+*.sqlite3
+.playwright/
+browser_*/
+node_modules/
+.DS_Store
+kdd_settings.json

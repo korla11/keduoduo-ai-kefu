@@ -1,0 +1,6 @@
+{
+  "13200090009": {
+    "password_hash": "REPLACE_WITH_WERKZEUG_HASH",
+    "note": "Only account allowed; set via install or first-run"
+  }
+}

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.keduoduo.gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__DEST__/venv/bin/python</string>
+    <string>__DEST__/app/gateway.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__DEST__/app</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PORT</key><string>4999</string>
+    <key>BILIGO_LAUNCH</key><string>process</string>
+    <key>BILIGO_GATEWAY_HOST</key><string>127.0.0.1</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>__DEST__/logs/gateway.log</string>
+  <key>StandardErrorPath</key><string>__DEST__/logs/gateway.log</string>
+</dict>
+</plist>

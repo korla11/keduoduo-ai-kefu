@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>客多多AI客服系统 - 抖音来客私信自动回复</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="douyin_theme.css">
+    <link rel="stylesheet" href="platform_tabs.css">
+</head>
+<body data-ai-platform="douyin_laike">
+    <div id="toast-container"></div>
+
+    <div class="container">
+        <header>
+            <div class="logo">
+                <h1>客多多AI客服系统</h1>
+                <div class="subtitle">抖音来客私信自动回复工具</div>
+            </div>
+            <div class="header-actions">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span class="version-badge">V3.2 Ultra</span>
+                    <button class="btn-switch btn-secondary dashboard-nav" onclick="location.href='/dashboard?from=laike'">仪表盘</button>
+                    <button class="btn-switch btn-secondary" onclick="openDocsPage()" title="教程文档">
+                        教程文档
+                    </button>
+                </div>
+                <div class="platform-switcher" id="platform-switcher">
+                    <button class="btn-switch btn-secondary platform-switcher-toggle" onclick="togglePlatformSwitcher(event)">
+                         切换平台 <span class="chevron">▾</span>
+                    </button>
+                    <div class="platform-switcher-menu">
+                        <button class="platform-switcher-item active" disabled>抖音来客 <span class="check">✓</span></button>
+                        <button class="platform-switcher-item" onclick="location.href='/douyin'">抖音私信</button>
+                        <button class="platform-switcher-item" onclick="location.href='/xiaohongshu'">小红书私信</button>
+                    </div>
+                </div>
+                <div class="status-indicator" id="status-indicator">
+                    <span class="status-icon" id="status-dot">●</span>
+                    <span id="status">未启动</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <section class="control-panel">
+                <h2>系统控制</h2>
+                <div class="button-group">
+                    <button class="btn-primary" id="start-btn" onclick="startLaikeMonitoring()">开始监控</button>
+                    <button class="btn-danger" id="stop-btn" onclick="stopLaikeMonitoring()" disabled>停止监控</button>
+                </div>
+
+                <div class="collapsible-section" style="margin-top: 20px;">
+                    <div class="collapsible-header" onclick="toggleLaikeTimingConfig()">
+                        <h3>⏰ 时间间隔配置</h3>
+                        <span class="toggle-icon" id="laike-timing-toggle-icon">▼</span>
+                    </div>
+                    <div class="collapsible-content" id="laike-timing-config-content" style="display: none;">
+                        <div class="form-row">
+                            <label for="laike-message-check-interval">消息监测间隔 (秒):</label>
+                            <input type="number" id="laike-message-check-interval" min="1" max="60" step="1" value="3" placeholder="3">
+                            <p class="help-text">控制检查新消息的频率，建议 3 秒</p>
+                        </div>
+                        <button class="btn-primary" onclick="saveLaikeTimingConfig()">保存时间配置</button>
+                    </div>
+                </div>
+
+                <div class="form-row" style="margin-top: 20px;">
+                    <label>当前监控账号:</label>
+                    <div id="laike-current-account" style="padding: 8px 12px; background: #f5f5f5; border-radius: 6px; margin-top: 4px; display: flex; align-items: center; gap: 10px;">
+                        <strong id="laike-account-display">未设置</strong>
+                        <span id="laike-groupid-display" style="color: #888; font-size: 12px;"></span>
+                        <select id="laike-account-select" style="padding: 6px 10px; min-width: 220px; display: none; border: 1px solid #ddd; border-radius: 6px;" onchange="onLaikeAccountSelect()">
+                            <option value="">-- 选择账号 --</option>
+                        </select>
+                    </div>
+                    <div style="margin-top: 8px;">
+                        <button class="btn-secondary" onclick="loadLaikeAccounts()" id="laike-load-accounts-btn">读取账号列表</button>
+                    </div>
+                    <p class="help-text">点击读取账号列表（后台运行不弹窗口），然后在上方下拉框中选择要监控的商家账号</p>
+                </div>
+                <div class="form-row" style="margin-top: 16px;">
+                    <label for="laike-groupid">Group ID（手动）:</label>
+                    <input type="text" id="laike-groupid" placeholder="1824515348029440" style="width: 220px;">
+                    <p class="help-text">从抖音来客私信页 URL 中获取 groupid 参数</p>
+                </div>
+                <div class="form-row" style="margin-top: 10px;">
+                    <label for="laike-bizview">Biz View ID:</label>
+                    <input type="text" id="laike-bizview" placeholder="22" style="width: 100px;">
+                </div>
+                <div class="form-row" style="margin-top: 10px;">
+                    <div class="checkbox-wrapper">
+                        <input type="checkbox" id="laike-headless" checked>
+                        <label for="laike-headless">无头模式（隐藏浏览器窗口）</label>
+                    </div>
+                </div>
+                <button class="btn-primary" onclick="saveLaikeConfig()" style="margin-top: 10px;">保存来客配置</button>
+            </section>
+
+            <section class="config-panel">
+                <h2>账号配置</h2>
+                <div class="info-banner douyin-banner" style="margin-bottom: 16px;">
+                    <div class="info-banner-icon"></div>
+                    <div class="info-banner-content">
+                        <strong>账号登录</strong>
+                        <p>抖音来客使用服务器上的无头浏览器。点击「登录来客」，在弹窗中输入手机号获取短信验证码登录
+                        （来客后台官方不支持扫码登录）；如遇安全验证，直接在弹窗截图上点击/拖动完成。</p>
+                        <p>登录成功后系统将自动保存会话，下次无需重复登录。</p>
+                    </div>
+                </div>
+                <div class="account-card" id="account-card">
+                    <div class="account-profile">
+                        <div class="account-avatar account-avatar--default" id="account-avatar">
+                            <img src="laike-icon.png" alt="抖音来客">
+                        </div>
+                        <div class="account-meta">
+                            <h3 id="account-nickname">未登录</h3>
+                            <p id="account-uid">life.douyin.com</p>
+                        </div>
+                    </div>
+                    <div class="account-row">
+                        <span class="label">登录状态</span>
+                        <span id="login-status-text" class="value warn">未登录</span>
+                    </div>
+                </div>
+                <div id="laike-store-picker" style="display:none;margin:8px 0">
+                    <span class="label">门店</span>
+                    <select style="padding:4px 6px;margin:0 6px"></select>
+                    <button class="btn-secondary" onclick="laikeSelectStore()">切换到此门店</button>
+                </div>
+                <div class="button-group">
+                    <button class="btn-primary" id="login-btn" onclick="startLaikeLogin()">登录来客</button>
+                    <button class="btn-secondary" onclick="laikeDetectAccount()">刷新账号</button>
+                    <button class="btn-secondary" onclick="laikeSwitchAccount()">切换账号</button>
+                </div>
+            </section>
+
+
+            <section class="log-panel">
+                <h2>运行日志</h2>
+                <div class="log-actions" style="margin-bottom: 10px;">
+                    <button class="btn-secondary" onclick="refreshLaikeLogs()">刷新</button>
+                    <button class="btn-secondary" onclick="clearLaikeLogs()">清空</button>
+                </div>
+                <div id="laike-live-status" style="padding:6px 10px;margin-bottom:8px;background:#f5f7fa;border-radius:6px;font-size:13px;color:#333">加载中…</div>
+                <div id="logs-container" class="log-viewer"></div>
+            </section>
+        </div>
+
+        <footer>
+            <p>© 2026 客多多AI客服系统</p>
+        </footer>
+    </div>
+
+    <script src="platform_ai.js"></script>
+    <script src="platform_tabs.js"></script>
+    <script src="laike_script.js"></script>
+</body>
+</html>
