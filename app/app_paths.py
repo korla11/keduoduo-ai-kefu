@@ -50,6 +50,8 @@ LEGACY_DATA_FILES = (
     'laike_blocked.json',
     'laike_greeted.json',
     'laike_leadcard_sent.json',
+    'laike_account_ai.json',
+    'laike_settings_override.json',
 )
 
 MIGRATION_MARKER = '.legacy_exe_dir_migrated'

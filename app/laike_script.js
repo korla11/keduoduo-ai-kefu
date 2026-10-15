@@ -2,7 +2,26 @@
 let laikeLogTimer = null;
 let laikeCurrentAccountId = '';
 let laikeAccounts = [];
-let laikeOverrideLoaded = false;
+
+function setLaikeCurrentAccount(id, notify) {
+    const next = id || '';
+    const changed = next !== laikeCurrentAccountId;
+    laikeCurrentAccountId = next;
+    window.laikeCurrentAccountId = next;
+    if ((notify || changed) && next) {
+        window.dispatchEvent(new CustomEvent('laike-account-changed'));
+    }
+}
+
+function laikeSelectedName() {
+    const acc = laikeAccounts.find(a => a.id === laikeCurrentAccountId);
+    return (acc && acc.name) || '当前账号';
+}
+
+function laikeShortName(name) {
+    const text = name || '当前账号';
+    return text.length > 10 ? text.slice(0, 10) + '…' : text;
+}
 
 function laikeFetch(url, options) {
     options = options ? Object.assign({}, options) : {};
@@ -44,7 +63,7 @@ async function startLaikeMonitoring() {
         });
         const data = await res.json();
         if (data.success) {
-            showToast('抖音来客监控已启动', 'success');
+            showToast(`已开始监控「${laikeSelectedName()}」。其他已启动的账号会继续各自扫描`, 'success');
             updateLaikeButtons(true);
             startLaikeLogPolling();
         } else {
@@ -60,9 +79,13 @@ async function stopLaikeMonitoring() {
         const res = await laikeFetch('/api/laike-stop', {method: 'POST'});
         const data = await res.json();
         if (data.success) {
-            showToast('抖音来客监控已停止', 'info');
+            const stoppedName = laikeSelectedName();
+            await refreshLaikeAccountInfo();
+            const still = laikeAccounts.some(a => a.monitoring);
+            showToast(still ? `已停止「${stoppedName}」。其他账号继续监控` : `已停止「${stoppedName}」`, 'info');
             updateLaikeButtons(false);
-            stopLaikeLogPolling();
+            if (still) startLaikeLogPolling();
+            else stopLaikeLogPolling();
         }
     } catch (e) {
         showToast('停止失败: ' + e.message, 'error');
@@ -70,8 +93,17 @@ async function stopLaikeMonitoring() {
 }
 
 function updateLaikeButtons(running) {
-    document.getElementById('start-btn').disabled = running;
-    document.getElementById('stop-btn').disabled = !running;
+    const start = document.getElementById('start-btn');
+    const stop = document.getElementById('stop-btn');
+    const multi = laikeAccounts.length > 1;
+    if (start) {
+        start.disabled = running;
+        start.textContent = multi ? `开始监控「${laikeShortName(laikeSelectedName())}」` : '开始监控';
+    }
+    if (stop) {
+        stop.disabled = !running;
+        stop.textContent = multi ? `停止「${laikeShortName(laikeSelectedName())}」` : '停止监控';
+    }
     const dot = document.getElementById('status-dot');
     const status = document.getElementById('status');
     const runningCount = laikeAccounts.filter(a => a.monitoring).length;
@@ -427,7 +459,7 @@ function renderLaikeAccountList(data) {
     const accounts = (data && data.accounts) || [];
     laikeAccounts = accounts;
     if (!laikeCurrentAccountId) {
-        laikeCurrentAccountId = (data && (data.account_id || data.active_id)) || (accounts[0] && accounts[0].id) || '';
+        setLaikeCurrentAccount((data && (data.account_id || data.active_id)) || (accounts[0] && accounts[0].id) || '', true);
     }
     const warn = document.getElementById('laike-memory-warning');
     if (warn) {
@@ -455,6 +487,8 @@ function renderLaikeAccountList(data) {
                 <strong>${escapeHtml(acc.name || acc.id)}</strong>
                 <span style="color:${acc.logged_in ? '#389e0d' : '#d48806'}">${acc.logged_in ? '已登录' : '未登录'}</span>
                 <span style="color:${acc.monitoring ? '#389e0d' : '#888'}">${acc.monitoring ? '监控中' : '未监控'}</span>
+                <span style="color:${acc.ai_enabled ? '#389e0d' : '#888'}">${acc.ai_enabled ? 'AI 开' : 'AI 关'}</span>
+                <span style="color:#555">知识库 ${acc.knowledge_count || 0}</span>
                 <span style="color:#888">${acc.browser_open ? '浏览器开着' : '浏览器已关闭'}</span>
                 ${acc.store_name ? `<span style="color:#555">${escapeHtml(acc.store_name)}</span>` : ''}
                 ${acc.groupid ? `<span style="color:#999;font-size:12px">groupid ${escapeHtml(acc.groupid)}</span>` : ''}
@@ -462,7 +496,7 @@ function renderLaikeAccountList(data) {
             <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">
                 <button class="btn-secondary" type="button" onclick="laikeSelectAccount('${acc.id}')">${selected ? '当前账号' : '选中'}</button>
                 <button class="btn-secondary" type="button" onclick="laikeLoginAccount('${acc.id}')">登录</button>
-                <button class="btn-primary" type="button" onclick="laikeToggleAccount('${acc.id}', ${acc.monitoring ? 'false' : 'true'})">${acc.monitoring ? '停止监控' : '开始监控'}</button>
+                <button class="btn-primary" type="button" onclick="laikeToggleAccount('${acc.id}', ${acc.monitoring ? 'false' : 'true'})">${acc.monitoring ? '停止此账号' : '开始此账号'}</button>
                 <button class="btn-secondary" type="button" onclick="laikeRenameAccount('${acc.id}')">改名</button>
                 <button class="btn-secondary" type="button" onclick="laikeRemoveAccount('${acc.id}')">删除</button>
             </div>
@@ -473,18 +507,25 @@ function renderLaikeAccountList(data) {
     if (status && accounts.length > 1) {
         status.textContent = running ? `${running} 个账号监控中` : '未启动';
     }
+    const copy = document.getElementById('laike-copy-from');
+    if (copy) {
+        const current = copy.value;
+        copy.innerHTML = '<option value="">空白，不复制</option>' + accounts.map(acc =>
+            `<option value="${acc.id}">复制「${escapeHtml(acc.name || acc.id)}」的 AI / 知识库 / 话术</option>`
+        ).join('');
+        if ([...copy.options].some(opt => opt.value === current)) copy.value = current;
+    }
+    updateLaikeButtons(!!(accounts.find(a => a.id === laikeCurrentAccountId) || {}).monitoring);
 }
 
 async function laikeSelectAccount(id) {
-    laikeCurrentAccountId = id;
+    setLaikeCurrentAccount(id, true);
     laikeLastLogKey = '';
     try {
         await laikeFetch('/api/laike-accounts/select', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})});
     } catch (e) {}
     await refreshLaikeAccountInfo();
     loadLaikeConfig();
-    laikeOverrideLoaded = false;
-    loadLaikeOverride().finally(() => { laikeOverrideLoaded = true; });
     refreshLaikeLogs();
 }
 
@@ -492,14 +533,15 @@ async function laikeAddAccount() {
     const name = prompt('新来客账号的名称（例如门店名）：', '');
     if (!name || !name.trim()) return;
     try {
+        const copyFrom = (document.getElementById('laike-copy-from') || {}).value || '';
         const data = await (await laikeFetch('/api/laike-accounts', {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: name.trim()}),
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name.trim(), copy_from: copyFrom}),
         })).json();
         if (!data.success) { showToast(data.error || '添加失败', 'error'); return; }
-        laikeCurrentAccountId = (data.account && data.account.id) || '';
-        showToast('已添加，请为这个账号单独登录', 'success');
+        setLaikeCurrentAccount((data.account && data.account.id) || '', true);
+        showToast(copyFrom ? '已添加，并复制了所选账号的 AI / 知识库 / 话术。请单独登录' : '已添加。AI、知识库和话术是空白的，请单独登录并配置', 'success');
         await refreshLaikeAccountInfo();
-        loadLaikeOverride();
         startLaikeLogin();
     } catch (e) {
         showToast('添加失败: ' + e.message, 'error');
@@ -524,11 +566,10 @@ async function laikeRemoveAccount(id) {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}),
     })).json();
     if (!data.success) { showToast(data.error || '删除失败', 'error'); return; }
-    if (laikeCurrentAccountId === id) laikeCurrentAccountId = data.active_id || '';
+    if (laikeCurrentAccountId === id) setLaikeCurrentAccount(data.active_id || '', true);
     showToast('已删除该来客账号', 'info');
     refreshLaikeAccountInfo();
     loadLaikeConfig();
-    loadLaikeOverride();
 }
 
 async function laikeLoginAccount(id) {
@@ -537,7 +578,7 @@ async function laikeLoginAccount(id) {
 }
 
 async function laikeToggleAccount(id, start) {
-    laikeCurrentAccountId = id;
+    setLaikeCurrentAccount(id, true);
     if (start) await startLaikeMonitoring();
     else await stopLaikeMonitoring();
     refreshLaikeAccountInfo();
@@ -574,49 +615,6 @@ async function saveLaikeBrowserLimit() {
     })).json();
     showToast(data.success ? `同时浏览器上限已设为 ${data.max_concurrent_browsers}` : '保存失败', data.success ? 'success' : 'error');
     renderLaikeAccountList(data);
-}
-
-function toggleLaikeOverrideFields() {
-    const on = document.getElementById('laike-override-enabled').checked;
-    document.getElementById('laike-override-fields').style.display = on ? 'block' : 'none';
-}
-
-async function loadLaikeOverride() {
-    if (!laikeCurrentAccountId) return;
-    try {
-        const data = await (await laikeFetch('/api/laike-accounts/settings')).json();
-        const enabled = !!data.enabled;
-        document.getElementById('laike-override-enabled').checked = enabled;
-        toggleLaikeOverrideFields();
-        const src = enabled ? (data.settings || {}) : (data.effective || {});
-        document.getElementById('laike-override-ai').checked = enabled ? src.ai_enabled !== false : data.ai_enabled !== false;
-        document.getElementById('laike-override-persona').value = src.persona || '';
-        document.getElementById('laike-override-rules').value = src.reply_rules || '';
-        document.getElementById('laike-override-delay').value = src.follow_up_delay || 120;
-        document.getElementById('laike-override-follow').checked = src.follow_up_enabled !== false;
-        document.getElementById('laike-override-greet').value = src.silent_greet_text || '';
-    } catch (e) {}
-}
-
-async function saveLaikeOverride() {
-    const enabled = document.getElementById('laike-override-enabled').checked;
-    const settings = {
-        ai_enabled: document.getElementById('laike-override-ai').checked,
-        persona: document.getElementById('laike-override-persona').value,
-        reply_rules: document.getElementById('laike-override-rules').value,
-        follow_up_delay: parseInt(document.getElementById('laike-override-delay').value, 10) || 120,
-        follow_up_enabled: document.getElementById('laike-override-follow').checked,
-        silent_greet_text: document.getElementById('laike-override-greet').value,
-        silent_greet_enabled: true,
-    };
-    try {
-        const data = await (await laikeFetch('/api/laike-accounts/settings', {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled, settings}),
-        })).json();
-        showToast(data.success ? (enabled ? '已保存此账号的独立回复设置' : '此账号改回共用设置') : '保存失败', data.success ? 'success' : 'error');
-    } catch (e) {
-        showToast('保存失败: ' + e.message, 'error');
-    }
 }
 
 async function refreshLaikeAccountInfo() {
@@ -682,6 +680,11 @@ async function laikeSwitchAccount() {
     startLaikeLogin();
 }
 
+function formatLaikeLiveStatus(st) {
+    const name = st.account_name ? `【${st.account_name}】` : '';
+    return `${name}${st.monitoring ? '🟢 监控中' : '⚪ 未监控'} ｜ 扫描 ${st.scan_count || 0} 次 ｜ 上次扫描 ${st.last_scan || '-'} ｜ 会话 ${st.conversations || 0} ｜ WebSocket ${st.ws_connected ? '已连接' : '未连接'}（帧 ${st.ws_frames || 0}）｜ 触发 ${st.trigger_count || 0} 次，最近 ${st.last_trigger || '-'}`;
+}
+
 let laikeLastLogKey = '';
 async function refreshLaikeLogs() {
     try {
@@ -689,10 +692,10 @@ async function refreshLaikeLogs() {
         const logUrl = allLogs && allLogs.checked ? '/api/laike-logs?scope=all' : '/api/laike-logs';
         const res = await laikeFetch(logUrl);
         const data = await res.json();
-        const st = data.status || {};
         const line = document.getElementById('laike-live-status');
         if (line) {
-            line.textContent = `${st.monitoring ? '🟢 监控中' : '⚪ 未监控'} ｜ 扫描 ${st.scan_count || 0} 次 ｜ 上次扫描 ${st.last_scan || '-'} ｜ 会话 ${st.conversations || 0} ｜ WebSocket ${st.ws_connected ? '已连接' : '未连接'}（帧 ${st.ws_frames || 0}）｜ 触发 ${st.trigger_count || 0} 次，最近 ${st.last_trigger || '-'}`;
+            const rows = (allLogs && allLogs.checked && data.statuses && data.statuses.length) ? data.statuses : [data.status || {}];
+            line.textContent = rows.map(formatLaikeLiveStatus).join('\n');
         }
         const container = document.getElementById('logs-container');
         if (!container) return;
@@ -756,20 +759,15 @@ document.addEventListener('click', function(event) {
 // 页面加载时初始化
 document.addEventListener('DOMContentLoaded', () => {
     laikeFetch('/api/laike-accounts').then(r => r.json()).then(data => {
-        if (data && data.active_id) laikeCurrentAccountId = data.active_id;
+        if (data && data.active_id) setLaikeCurrentAccount(data.active_id, true);
         renderLaikeAccountList(data);
-        loadLaikeOverride().finally(() => { laikeOverrideLoaded = true; });
     }).catch(() => {});
     loadLaikeConfig();
     refreshLaikeAccountInfo();
     laikeFetch('/api/laike-status').then(r => r.json()).then(d => {
-        if (d && d.account_id && !laikeCurrentAccountId) laikeCurrentAccountId = d.account_id;
+        if (d && d.account_id && !laikeCurrentAccountId) setLaikeCurrentAccount(d.account_id, true);
         renderLaikeAccountList(d);
         updateLaikeButtons(!!d.monitoring);
-        if (!laikeOverrideLoaded && laikeCurrentAccountId) {
-            laikeOverrideLoaded = true;
-            loadLaikeOverride();
-        }
         if ((d.accounts || []).some(a => a.monitoring) || d.monitoring) startLaikeLogPolling();
     }).catch(() => {});
     // 监听 tab 切换，切到日志 tab 时刷新
@@ -788,7 +786,7 @@ window.addEventListener('hashchange', () => {
         refreshLaikeLogs();
         // 确保轮询在运行
         laikeFetch('/api/laike-status').then(r => r.json()).then(d => {
-            if (d.monitoring && !laikeLogTimer) startLaikeLogPolling();
+            if (((d.accounts || []).some(a => a.monitoring) || d.monitoring) && !laikeLogTimer) startLaikeLogPolling();
         }).catch(() => {});
     }
 });

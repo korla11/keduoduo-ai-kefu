@@ -111,11 +111,17 @@ class AiHandoffStore:
             'updated_at': row['updated_at'],
             'replied_at': row['replied_at'],
         }
+        try:
+            target = json.loads(row['target_json'] or '{}')
+        except (TypeError, ValueError):
+            target = {}
+        if not isinstance(target, dict):
+            target = {}
+        if target.get('laike_account_id'):
+            item['laike_account_id'] = str(target.get('laike_account_id') or '')
+            item['laike_account_name'] = str(target.get('laike_account_name') or '')
         if include_target:
-            try:
-                item['_target'] = json.loads(row['target_json'] or '{}')
-            except (TypeError, ValueError):
-                item['_target'] = {}
+            item['_target'] = target
             item['_sender_id'] = row['sender_id']
             item['_external_key'] = row['external_key']
         return item

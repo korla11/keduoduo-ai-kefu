@@ -1224,15 +1224,24 @@ class DouyinLaikeWorker:
                 const auto = isSelf && /此消息由「/.test(box.innerText || '');
                 out.push({text, is_self: isSelf, sender: '', msg_id: mid, auto});
             });
-            return out;
+            return {rows: out, total: items.length};
         }
         """
         fr = self._frame_with('.csUI-NormalMessage')
         try:
-            rows = fr.evaluate(js, limit) or []
+            payload = fr.evaluate(js, limit) or []
         except Exception as exc:
             logger.warning('读取来客消息失败: %s', exc)
-            rows = []
+            payload = []
+        if isinstance(payload, dict):
+            rows = payload.get('rows') or []
+            try:
+                self.last_message_total = int(payload.get('total') or 0)
+            except (TypeError, ValueError):
+                self.last_message_total = len(rows)
+        else:
+            rows = payload or []
+            self.last_message_total = len(rows)
         return rows
 
     # ── 智能客服（机器人）接待 → 人工接管 ──
