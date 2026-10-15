@@ -47,11 +47,16 @@
             <section class="control-panel" id="laike-accounts-panel">
                 <h2>来客账号</h2>
                 <div id="laike-memory-warning" style="display:none;margin:8px 0 12px;padding:10px 12px;background:#fff7e6;border:1px solid #ffd591;border-radius:8px;color:#874d00;font-size:13px;line-height:1.5"></div>
-                <p class="help-text">每个账号单独一个浏览器配置（cookies 不共享），可以同时保持登录、分别开始或停止监控。只配置一个账号时，行为和原来一样。</p>
+                <p class="help-text">每个账号单独一个浏览器，也单独一套 AI 回复、话术和知识库。可以同时保持登录、分别监控。只配置一个账号时，行为和原来一样。</p>
+                <p class="help-text">选中某个账号后，到左侧「AI 回复 / 话术」和「知识库」修改，只影响这个账号。新账号默认是空白配置；也可以在添加时从已有账号复制一份。</p>
                 <p class="help-text">不要在两台电脑上同时登录或监控同一个来客账号，否则会互相顶掉登录并重复回复。这里的账号不是下方「读取账号列表」里的门店。</p>
                 <div id="laike-account-list" style="display:flex;flex-direction:column;gap:8px;margin:10px 0"></div>
-                <div class="button-group">
+                <div class="button-group" style="flex-wrap:wrap;align-items:center">
                     <button class="btn-primary" type="button" onclick="laikeAddAccount()">添加账号</button>
+                    <label for="laike-copy-from" style="font-size:13px;color:#555">添加时</label>
+                    <select id="laike-copy-from" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;min-width:180px">
+                        <option value="">空白，不复制</option>
+                    </select>
                     <button class="btn-secondary" type="button" onclick="startAllLaike()">全部开始监控</button>
                     <button class="btn-secondary" type="button" onclick="stopAllLaike()">全部停止</button>
                 </div>
@@ -60,31 +65,6 @@
                     <input type="number" id="laike-max-browsers" min="1" max="8" step="1" value="3" style="width:80px">
                     <button class="btn-secondary" type="button" onclick="saveLaikeBrowserLimit()">保存上限</button>
                     <p class="help-text" id="laike-browser-usage">每个 Chromium 大约占用数百 MB。内存小的电脑请保持 1。</p>
-                </div>
-                <div class="form-row" style="margin-top:8px">
-                    <div class="checkbox-wrapper">
-                        <input type="checkbox" id="laike-override-enabled" onchange="toggleLaikeOverrideFields()">
-                        <label for="laike-override-enabled">此账号使用独立回复设置（不勾选则沿用「AI 回复」里的抖音来客设置）</label>
-                    </div>
-                    <div id="laike-override-fields" style="display:none;margin-top:8px">
-                        <div class="checkbox-wrapper">
-                            <input type="checkbox" id="laike-override-ai">
-                            <label for="laike-override-ai">此账号启用 AI 回复</label>
-                        </div>
-                        <label for="laike-override-persona">人设</label>
-                        <textarea id="laike-override-persona" rows="3" style="width:100%"></textarea>
-                        <label for="laike-override-rules">回复规则</label>
-                        <textarea id="laike-override-rules" rows="3" style="width:100%"></textarea>
-                        <label for="laike-override-delay">二次触达延迟（秒）</label>
-                        <input type="number" id="laike-override-delay" min="30" max="86400" value="120" style="width:100px">
-                        <div class="checkbox-wrapper">
-                            <input type="checkbox" id="laike-override-follow" checked>
-                            <label for="laike-override-follow">启用二次触达</label>
-                        </div>
-                        <label for="laike-override-greet">进线问候</label>
-                        <input type="text" id="laike-override-greet" style="width:100%" placeholder="在的，亲">
-                    </div>
-                    <button class="btn-secondary" type="button" onclick="saveLaikeOverride()" style="margin-top:8px">保存此账号回复设置</button>
                 </div>
             </section>
 
@@ -188,7 +168,7 @@
                     <button class="btn-secondary" onclick="clearLaikeLogs()">清空</button>
                     <label style="margin-left:8px;font-size:13px"><input type="checkbox" id="laike-logs-all" checked onchange="refreshLaikeLogs()"> 显示全部账号</label>
                 </div>
-                <div id="laike-live-status" style="padding:6px 10px;margin-bottom:8px;background:#f5f7fa;border-radius:6px;font-size:13px;color:#333">加载中…</div>
+                <div id="laike-live-status" style="padding:6px 10px;margin-bottom:8px;background:#f5f7fa;border-radius:6px;font-size:13px;color:#333;white-space:pre-wrap;line-height:1.6">加载中…</div>
                 <div id="logs-container" class="log-viewer"></div>
             </section>
         </div>

@@ -98,6 +98,61 @@ def laike_dashboard_status() -> Dict[str, Any]:
     return get_manager().dashboard_status()
 
 
+_FRESH_TIME_RE = re.compile(r'^(刚刚|刚才|\d+\s*秒(?:钟)?前?|\d+\s*分钟前?)')
+
+
+def conversation_open_reason(
+    *,
+    preview: str,
+    unread: int,
+    last_time: str,
+    parsed_time: Optional[float],
+    seen: bool,
+    seen_preview: str,
+    seen_time: Optional[float],
+    seen_time_text: Optional[str],
+    monitor_started_at: float,
+    allow_fresh: bool,
+) -> str:
+    """决定要不要打开这个会话。返回 baseline（只记录）、空字符串（跳过）或其他原因。
+
+    「刚刚」会在每次解析时变成当前时间，同一句预览（例如连续发送的「测试监控」）
+    在 90 秒内不会被当成更新。时间文本仍是刚刚/分钟内时，允许再打开，靠消息条数区分新消息。
+    """
+    recent = parsed_time is not None and parsed_time >= float(monitor_started_at or 0) - 90
+    if not seen:
+        if unread or recent or parsed_time is None:
+            return 'new'
+        return 'baseline'
+    if unread:
+        return 'unread'
+    if (preview or '') != (seen_preview or ''):
+        return 'preview'
+    if seen_time_text is not None and (last_time or '') != (seen_time_text or ''):
+        return 'time'
+    if parsed_time is not None and (seen_time is None or parsed_time > seen_time + 90):
+        return 'newer'
+    if allow_fresh and _FRESH_TIME_RE.match((last_time or '').strip()):
+        return 'fresh'
+    return ''
+
+
+def incoming_signature_changed(prev_sig: Optional[str], sig: str,
+                               prev_total: Optional[int], total: Optional[int]) -> bool:
+    """消息指纹变了，或页面上的消息条数变多（重复文本、没有消息 id 时也能认出来）。"""
+    if prev_sig != sig:
+        return True
+    return isinstance(total, int) and isinstance(prev_total, int) and total > prev_total
+
+
+def _message_total(browser) -> Optional[int]:
+    raw = getattr(browser, 'last_message_total', None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def laike_system_for_target(target: Optional[Dict[str, Any]]) -> 'DouyinLaikeReplySystem':
     from laike_accounts import LaikeAccountError, get_manager
     account_id = str((target or {}).get('laike_account_id') or '')
@@ -210,45 +265,116 @@ class DouyinLaikeReplySystem:
             return rest[-1] if len(rest) >= 2 else key
         return key
 
-    def _read_override(self) -> Dict[str, Any]:
-        data = _load_json_file(self._file('laike_settings_override.json'))
-        return data if isinstance(data, dict) else {}
+    def _ai_lock(self) -> threading.Lock:
+        lock = getattr(self, '_account_ai_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._account_ai_lock = lock
+        return lock
+
+    def _account_ai_path(self) -> str:
+        return self._file('laike_account_ai.json')
+
+    def ensure_account_ai(self) -> Dict[str, Any]:
+        """本账号自己的 AI / 话术 / 知识库。没有文件时，从当时的共用配置复制一份（只发生一次）。"""
+        from laike_account_ai import (
+            load_document, read_json, save_document, snapshot_from_shared, user_root_for,
+        )
+        with self._ai_lock():
+            cached = getattr(self, '_ai_doc', None)
+            if isinstance(cached, dict):
+                return cached
+            path = self._account_ai_path()
+            doc = load_document(path)
+            if doc is None:
+                root = user_root_for(self.data_dir, bool(self.legacy or self.account_id == 'default'))
+                config = read_json(os.path.join(root, 'config.json'))
+                override = read_json(self._file('laike_settings_override.json'))
+                source = 'migrated' if (self.legacy or self.account_id == 'default') else 'snapshot'
+                doc = snapshot_from_shared(
+                    config, override, knowledge_root=os.path.join(root, 'ai_knowledge'), source=source,
+                )
+                save_document(path, doc)
+            self._ai_doc = doc
+            return doc
+
+    def account_ai(self) -> Dict[str, Any]:
+        return self.ensure_account_ai()
+
+    def _store_account_ai(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+        from laike_account_ai import save_document
+        with self._ai_lock():
+            save_document(self._account_ai_path(), doc)
+            self._ai_doc = doc
+            return doc
 
     def _platform_settings(self) -> Dict[str, Any]:
-        """共享的抖音来客 AI 设置；本账号若打开覆盖，则只替换写明的字段。"""
-        from ai_reply_service import get_platform_settings, normalize_platform_settings
-        base = get_platform_settings(self.AI_PLATFORM_KEY)
-        override = self._read_override()
-        if not override.get('enabled'):
-            return base
-        patch = override.get('settings') if isinstance(override.get('settings'), dict) else {}
-        if not patch:
-            return base
-        merged = dict(base)
-        merged.update(patch)
-        return normalize_platform_settings(self.AI_PLATFORM_KEY, merged)
+        """只读这个来客账号自己的话术和策略，不再回退到平台共用设置。"""
+        from laike_account_ai import public_settings
+        return public_settings(self.account_ai())
 
     def _ai_enabled(self) -> bool:
-        override = self._read_override()
-        settings = override.get('settings') if isinstance(override.get('settings'), dict) else {}
-        if override.get('enabled') and 'ai_enabled' in settings:
-            return bool(settings.get('ai_enabled'))
-        return bool(_get_ai()['enabled'](self.AI_PLATFORM_KEY))
+        from ai_reply_service import load_provider
+        provider = load_provider()
+        if not provider.get('enabled') or not provider.get('api_key'):
+            return False
+        return bool(self.account_ai().get('ai_enabled'))
 
-    def set_settings_override(self, enabled: bool, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        allowed = {
-            'persona', 'reply_rules', 'follow_up_enabled', 'follow_up_delay', 'follow_up_prompt',
-            'silent_greet_enabled', 'silent_greet_text', 'silent_greet_delay',
-            'lead_card_on_follow_up', 'no_question_fallback', 'blacklist', 'ai_enabled',
-            'contact_thanks', 'after_lead_replies',
+    def _knowledge(self) -> Dict[str, Any]:
+        from laike_account_ai import knowledge_for_prompt
+        return knowledge_for_prompt(self.account_ai())
+
+    def _provider_for_ai(self) -> Dict[str, Any]:
+        """全局接口密钥仍共用；人设、违禁词和上下文窗口换成这个账号自己的。"""
+        from ai_reply_service import load_provider
+        provider = dict(load_provider())
+        settings_map = dict(provider.get('platform_settings') or {})
+        settings_map[self.AI_PLATFORM_KEY] = self._platform_settings()
+        provider['platform_settings'] = settings_map
+        return provider
+
+    def _ai_decision(self, message: str, instruction: str) -> Dict[str, Any]:
+        return _get_ai()['gen'](
+            message, instruction,
+            provider=self._provider_for_ai(),
+            knowledge=self._knowledge(),
+            platform=self.AI_PLATFORM_KEY,
+        )
+
+    def save_account_settings(self, settings: Optional[Dict[str, Any]] = None,
+                              ai_enabled: Optional[bool] = None,
+                              use_global_model_settings: bool = False) -> Dict[str, Any]:
+        from laike_account_ai import merge_settings, public_settings
+        doc = merge_settings(dict(self.account_ai()), settings or {}, use_global_model_settings)
+        if ai_enabled is not None:
+            doc['ai_enabled'] = bool(ai_enabled)
+        elif isinstance(settings, dict) and 'ai_enabled' in settings:
+            doc['ai_enabled'] = bool(settings.get('ai_enabled'))
+        self._store_account_ai(doc)
+        return {
+            'ai_enabled': bool(doc.get('ai_enabled')),
+            'settings': public_settings(doc),
+            'effective': public_settings(doc),
+            'shared': False,
+            'enabled': True,
+            'source': doc.get('source') or '',
         }
-        patch = {}
-        for key, value in (settings or {}).items():
-            if key in allowed:
-                patch[key] = value
-        payload = {'enabled': bool(enabled), 'settings': patch if enabled else {}}
-        _write_json_file(self._file('laike_settings_override.json'), payload)
-        return {'enabled': payload['enabled'], 'settings': patch, 'effective': self._platform_settings()}
+
+    def save_account_knowledge_base(self, base_id: str, name: str, text: str) -> Dict[str, Any]:
+        from laike_account_ai import normalize_account_knowledge, save_knowledge_base
+        doc, saved = save_knowledge_base(dict(self.account_ai()), base_id, name, text)
+        self._store_account_ai(doc)
+        return {'knowledge': normalize_account_knowledge(doc.get('knowledge')), 'knowledge_base': saved}
+
+    def save_account_knowledge_settings(self, enabled: bool, assigned_ids: List[str]) -> Dict[str, Any]:
+        from laike_account_ai import normalize_account_knowledge, save_knowledge_settings
+        doc = save_knowledge_settings(dict(self.account_ai()), enabled, assigned_ids)
+        self._store_account_ai(doc)
+        return normalize_account_knowledge(doc.get('knowledge'))
+
+    def install_account_ai(self, doc: Dict[str, Any]) -> None:
+        """创建账号时写入已经准备好的文档（空白或从别的账号复制）。"""
+        self._store_account_ai(doc)
 
     def maybe_resume(self) -> None:
         """服务重启：只恢复这个账号自己重启前开着的监控。"""
@@ -620,11 +746,12 @@ class DouyinLaikeReplySystem:
             release(self)
         return {'success': True}
 
-    def stop_monitoring(self) -> Dict[str, Any]:
+    def stop_monitoring(self, reason: str = '手动停止') -> Dict[str, Any]:
         self.monitoring = False
         self._monitor_stop.set()
         self._wake.set()
-        self.add_log(f'抖音来客私信监控已停止（{self.account_name}）', 'info')
+        why = f'，{reason}' if reason else ''
+        self.add_log(f'抖音来客私信监控已停止（{self.account_name}{why}）', 'info')
         self._mon_stopped_at = time.time()
         self._start_browser_reaper()
         return {'success': True}
@@ -751,7 +878,7 @@ class DouyinLaikeReplySystem:
         if dry_run:
             return {'success': True, 'dry_run': True, 'plan': plan}
         if self.monitoring:
-            self.stop_monitoring()
+            self.stop_monitoring('退出登录')
             t = self.monitor_thread
             if t is not None:
                 t.join(timeout=30)
@@ -787,6 +914,7 @@ class DouyinLaikeReplySystem:
         fired = self._wake.wait(timeout=interval)
         if self._monitor_stop.is_set():
             return True
+        self._scan_from_ws = bool(fired)
         if fired:
             # 防抖：等 500ms 让同一批帧到齐
             time.sleep(0.2)
@@ -960,9 +1088,14 @@ class DouyinLaikeReplySystem:
         if not msgs:
             return
         sig = self._msg_signature(msgs)
+        total = _message_total(browser)
+        totals = self.__dict__.setdefault('_conv_total', {})
         prev_sig = self._conv_sig.get(user_key)
+        prev_total = totals.get(user_key)
         self._conv_sig[user_key] = sig
-        if prev_sig == sig:
+        totals[user_key] = total
+        changed = incoming_signature_changed(prev_sig, sig, prev_total, total)
+        if not changed:
             return
         latest = msgs[-1]
         msg_text = (latest.text or '').strip()
@@ -971,9 +1104,10 @@ class DouyinLaikeReplySystem:
         if prev_sig is None and not allow_unseen:
             return  # 首次看到的旧会话：仅记录
         done = self._replied_msgs.setdefault(user_key, set())
-        if sig in done:
+        token = f'{sig}@n:{total}' if (prev_sig == sig and total is not None) else sig
+        if token in done:
             return
-        done.add(sig)
+        done.add(token)
         if len(done) > 200:
             self._replied_msgs[user_key] = set(list(done)[-100:])
         fp = sig
@@ -1006,6 +1140,9 @@ class DouyinLaikeReplySystem:
                 after = browser.read_messages(limit=10)
             if after:
                 self._conv_sig[user_key] = self._msg_signature(after)
+                total = _message_total(browser)
+                if total is not None:
+                    self.__dict__.setdefault('_conv_total', {})[user_key] = total
         except Exception:
             pass
 
@@ -1125,7 +1262,11 @@ class DouyinLaikeReplySystem:
                     with self._browser_use_lock:
                         after = browser.read_messages(limit=10)
                     if after:
-                        self._conv_sig[user_key] = self._msg_signature([m for m in after if not getattr(m, 'auto', False)])
+                        visible = [m for m in after if not getattr(m, 'auto', False)]
+                        self._conv_sig[user_key] = self._msg_signature(visible)
+                        total = _message_total(browser)
+                        if total is not None:
+                            self.__dict__.setdefault('_conv_total', {})[user_key] = total
                 except Exception:
                     pass
             else:
@@ -1143,7 +1284,7 @@ class DouyinLaikeReplySystem:
                     self.add_log('⚠️ 来客未登录或会话已失效，请先在「账号配置」中完成登录', 'error')
                     self._laike_logged_in = False
                     self._persist_state()
-                    self.monitoring = False
+                    self.stop_monitoring('登录已失效')
                     return
             except Exception as exc:
                 self.add_log(f'检查登录态失败: {exc}', 'warning')
@@ -1151,11 +1292,19 @@ class DouyinLaikeReplySystem:
                 groupid=str(self.config.get('laike_groupid') or ''),
                 biz_view_id=str(self.config.get('laike_biz_view_id') or ''),
             )
-            try:
-                browser.navigate_chat()
-            except Exception as exc:
-                self.add_log(f'导航到来客会话页失败: {exc}', 'error')
-                self.monitoring = False
+            nav_err = None
+            for attempt in range(1, 4):
+                try:
+                    browser.navigate_chat()
+                    nav_err = None
+                    break
+                except Exception as exc:
+                    nav_err = exc
+                    self.add_log(f'导航到来客会话页失败（第{attempt}次）: {exc}', 'warning')
+                    if attempt < 3:
+                        time.sleep(2)
+            if nav_err is not None:
+                self.stop_monitoring('无法打开会话页')
                 return
             # 守卫：当前登录账号的 groupid 与保存值不同时自动更新
             try:
@@ -1182,8 +1331,11 @@ class DouyinLaikeReplySystem:
         self._monitor_started_at = since
         self.add_log(f'监控起点：{time.strftime("%H:%M:%S", time.localtime(since))}（此后到达的客户消息都会处理）', 'info')
         self._last_conv_time = {}
+        self._last_conv_time_text = {}
         self._conv_sig = {}
+        self._conv_total = {}
         self._open_nick = ''
+        self._scan_from_ws = False
 
         while self.monitoring and not self._monitor_stop.is_set():
             try:
@@ -1208,17 +1360,27 @@ class DouyinLaikeReplySystem:
                         self.add_log(f'🐛 调试: 标题="{dbg.get("title","")}" | groupid={gid.group(1) if gid else "无"} | div数={dbg.get("div_count",0)} | 有会话特征={dbg.get("has_conv_hint",False)}', 'warning')
                     except Exception as _e:
                         self.add_log(f'获取页面调试信息失败: {_e}', 'warning')
+                if len(conversations) == 0 and getattr(self, '_scan_from_ws', False):
+                    if time.time() - getattr(self, '_empty_ws_log_at', 0) > 60:
+                        self._empty_ws_log_at = time.time()
+                        self.add_log('WebSocket 有新信号，但这个账号的会话列表是空的。请确认该账号的浏览器停在私信页（其他账号继续各自扫描）', 'warning')
                 if not baseline_done:
                     # 基线：只记录“监控开始之前”的会话状态；开始后才到达的消息不计入基线
                     fresh = 0
                     for conv in conversations:
                         key = self.user_key(conv.nickname)
                         t = self._parse_conv_time(conv.last_time)
-                        if conv.unread or (t is not None and t >= self._monitor_started_at - 90):
-                            fresh += 1  # 不记基线 → 下面会被当作新会话检查
+                        reason = conversation_open_reason(
+                            preview=conv.preview or '', unread=int(conv.unread or 0), last_time=conv.last_time or '',
+                            parsed_time=t, seen=False, seen_preview='', seen_time=None, seen_time_text=None,
+                            monitor_started_at=self._monitor_started_at, allow_fresh=False,
+                        )
+                        if reason != 'baseline':
+                            fresh += 1
                             continue
                         self.last_seen_preview[key] = conv.preview or ''
                         self._last_conv_time[key] = t
+                        self._last_conv_time_text[key] = conv.last_time or ''
                     baseline_done = True
                     self.add_log(f'已记录 {len(conversations) - fresh} 个会话基线（监控开始后的 {fresh} 个会话将正常检查），仅回复新消息', 'info')
 
@@ -1232,36 +1394,48 @@ class DouyinLaikeReplySystem:
                     self._t_detect = time.time() - _t0
                     checked.add(open_nick)
                     self._process_messages(self.user_key(open_nick), open_nick, msgs, browser, allow_unseen=True)
-                for conv in reversed(conversations):  # 等待最久的先处理
-                    if not self.monitoring or self._monitor_stop.is_set():
-                        break
+                pending = []
+                fresh_left = 3
+                for conv in conversations:
                     nickname = (conv.nickname or '').strip()
                     if not nickname or '群' in nickname:
                         continue
                     user_key = self.user_key(nickname)
-                    preview = conv.preview or ''
                     if conv.has_lead and not self._has_left_contact.get(user_key):
                         self._has_left_contact[user_key] = True
                         record_dashboard_event(self.AI_PLATFORM_KEY, 'lead', f'{user_key}|lead', contact_id=user_key)
                         self.add_log(f'📇 [{nickname}] 会话列表显示已留资', 'info')
                     t = self._parse_conv_time(conv.last_time)
-                    prev = self.last_seen_preview.get(user_key)
-                    prev_t = self._last_conv_time.get(user_key)
-                    newer = t is not None and (prev_t is None or t > prev_t + 90)
-                    recent = t is not None and t >= self._monitor_started_at - 90
-                    if prev is None:
-                        # 基线之后出现的会话：有未读，或最后消息时间在监控开始之后（含已被标为已读的）
-                        if not (conv.unread or recent or t is None):
-                            self.last_seen_preview[user_key] = preview
-                            self._last_conv_time[user_key] = t
-                            continue
-                    elif preview == prev and not conv.unread and not newer:
+                    seen = user_key in self.last_seen_preview
+                    reason = conversation_open_reason(
+                        preview=conv.preview or '', unread=int(conv.unread or 0), last_time=conv.last_time or '',
+                        parsed_time=t, seen=seen, seen_preview=self.last_seen_preview.get(user_key, ''),
+                        seen_time=self._last_conv_time.get(user_key),
+                        seen_time_text=self._last_conv_time_text.get(user_key) if seen else None,
+                        monitor_started_at=self._monitor_started_at, allow_fresh=fresh_left > 0,
+                    )
+                    if reason == 'baseline':
+                        self.last_seen_preview[user_key] = conv.preview or ''
+                        self._last_conv_time[user_key] = t
+                        self._last_conv_time_text[user_key] = conv.last_time or ''
                         continue
-                    self.last_seen_preview[user_key] = preview
+                    if not reason:
+                        continue
+                    if reason == 'fresh':
+                        fresh_left -= 1
+                    self.last_seen_preview[user_key] = conv.preview or ''
                     if t is not None:
                         self._last_conv_time[user_key] = t
+                    self._last_conv_time_text[user_key] = conv.last_time or ''
+                    pending.append((conv, reason, seen, t))
+                for conv, reason, seen, t in reversed(pending):  # 等待最久的先处理
+                    if not self.monitoring or self._monitor_stop.is_set():
+                        break
+                    nickname = (conv.nickname or '').strip()
                     if nickname in checked:
                         continue
+                    user_key = self.user_key(nickname)
+                    recent = t is not None and t >= self._monitor_started_at - 90
                     _t0 = time.time()
                     with self._browser_use_lock:
                         browser.open_conversation(nickname)
@@ -1269,8 +1443,10 @@ class DouyinLaikeReplySystem:
                     self._t_detect = time.time() - _t0
                     self._open_nick = nickname
                     checked.add(nickname)
-                    self._process_messages(user_key, nickname, msgs, browser,
-                                           allow_unseen=prev is not None or bool(conv.unread) or recent)
+                    self._process_messages(
+                        user_key, nickname, msgs, browser,
+                        allow_unseen=seen or bool(conv.unread) or recent or reason == 'fresh',
+                    )
                     self._run_due_greets(browser)  # 进线问候优先：检测到就发，不等整轮扫描结束
 
                 open_nick = getattr(self, '_open_nick', '')
@@ -1384,7 +1560,7 @@ class DouyinLaikeReplySystem:
         ai = _get_ai()
         # 抖音来客使用独立平台开关；未单独配置时 ai_reply_service 自动回退到抖音私信的开关
         if not self._ai_enabled():
-            self.add_log(f'[{nickname}] 抖音来客 AI 未启用（AI回复 → 抖音来客），跳过', 'warning')
+            self.add_log(f'[{nickname}] 账号「{self.account_name}」的 AI 回复未启用（AI 回复 / 话术），跳过', 'warning')
             return
         try:
             ctx = ai['build_ctx'](self.AI_PLATFORM_KEY, user_key)
@@ -1411,16 +1587,19 @@ class DouyinLaikeReplySystem:
             instruction += '\n\n' + ctx
         _ta = time.time()
         try:
-            decision = ai['gen'](msg_text, instruction, platform=self.AI_PLATFORM_KEY)
+            decision = self._ai_decision(msg_text, instruction)
         except Exception as exc:
             self.add_log(f'❌ [{nickname}] AI 生成失败: {exc}', 'error')
             return
         _t_ai = time.time() - _ta
         reply_text = (decision.get('reply') or '').strip()
         if reply_text and self._is_question(reply_text):
-            reply_text = self._fix_question(nickname, reply_text,
-                                            lambda: (ai['gen'](msg_text, instruction + '\n\n上一版回复含有提问，这次只能用陈述句，绝对不能有问号或吗/呢等问句。',
-                                                               platform=self.AI_PLATFORM_KEY).get('reply') or '').strip())
+            reply_text = self._fix_question(
+                nickname, reply_text,
+                lambda: (self._ai_decision(
+                    msg_text, instruction + '\n\n上一版回复含有提问，这次只能用陈述句，绝对不能有问号或吗/呢等问句。',
+                ).get('reply') or '').strip(),
+            )
         if not reply_text:
             self.add_log(f'❌ [{nickname}] AI 回复为空，已跳过', 'error')
             return
@@ -1605,13 +1784,12 @@ class DouyinLaikeReplySystem:
                 ctx = ''
             if ctx:
                 instruction += '\n\n' + ctx
-        decision = ai['gen']('【系统】客户约两分钟没回，请按要求写一句二次触达消息，只输出这句话本身',
-                             instruction, platform=self.AI_PLATFORM_KEY)
+        decision = self._ai_decision('【系统】客户约两分钟没回，请按要求写一句二次触达消息，只输出这句话本身', instruction)
         text = (decision.get('reply') or '').strip()
         if text and self._is_question(text):
-            text = self._fix_question(self.nick_from_key(user_key), text, lambda: (ai['gen'](
+            text = self._fix_question(self.nick_from_key(user_key), text, lambda: (self._ai_decision(
                 '【系统】请按要求写一句二次触达消息，只能用陈述句，绝对不能有问号或吗/呢等问句', instruction,
-                platform=self.AI_PLATFORM_KEY).get('reply') or '').strip())
+            ).get('reply') or '').strip())
         return text
 
     _Q_TAIL_RE = re.compile(r'(吗|呢|不|么|没|呀吗|是不是|哪方面|方便吗|可以吗|好不好|行不行)[～~。！!…\s哈呀哦嘛]*$')
@@ -1757,7 +1935,7 @@ def register_laike_routes(app) -> None:
             return jsonify(manager.public_state())
         data = request.get_json(silent=True) or {}
         try:
-            system = manager.create(str(data.get('name') or ''))
+            system = manager.create(str(data.get('name') or ''), copy_from=str(data.get('copy_from') or ''))
         except LaikeAccountError as exc:
             return jsonify({'success': False, 'error': str(exc)}), 400
         return jsonify({'success': True, 'account': manager.public_account(system.account_id), **manager.public_state()})
@@ -1795,22 +1973,82 @@ def register_laike_routes(app) -> None:
         value = get_manager().set_max_browsers(data.get('max_concurrent_browsers'))
         return jsonify({'success': True, 'max_concurrent_browsers': value, **get_manager().public_state()})
 
-    @app.route('/api/laike-accounts/settings', methods=['GET', 'POST'])
-    def laike_accounts_settings():
+    def _ai_payload(system):
+        from laike_account_ai import normalize_account_knowledge, public_settings
+        doc = system.account_ai()
+        settings = public_settings(doc)
+        return {
+            'success': True,
+            'account_id': system.account_id,
+            'account_name': system.account_name,
+            'ai_enabled': bool(doc.get('ai_enabled')),
+            'enabled': True,
+            'shared': False,
+            'source': doc.get('source') or '',
+            'settings': settings,
+            'effective': settings,
+            'knowledge': normalize_account_knowledge(doc.get('knowledge')),
+        }
+
+    @app.route('/api/laike-accounts/ai', methods=['GET', 'POST'])
+    def laike_accounts_ai():
         s = _acct()
         if request.method == 'GET':
-            current = s._read_override()
-            return jsonify({
-                'success': True,
-                'account_id': s.account_id,
-                'enabled': bool(current.get('enabled')),
-                'ai_enabled': s._ai_enabled(),
-                'settings': current.get('settings') if isinstance(current.get('settings'), dict) else {},
-                'effective': s._platform_settings(),
-                'shared': not bool(current.get('enabled')),
-            })
+            return jsonify(_ai_payload(s))
         data = request.get_json(silent=True) or {}
-        saved = s.set_settings_override(bool(data.get('enabled')), data.get('settings') if isinstance(data.get('settings'), dict) else {})
+        settings = data.get('settings') if isinstance(data.get('settings'), dict) else {
+            k: v for k, v in data.items() if k not in ('account_id', 'ai_enabled', 'settings')
+        }
+        ai_enabled = data.get('ai_enabled') if 'ai_enabled' in data else None
+        saved = s.save_account_settings(
+            settings, ai_enabled=ai_enabled,
+            use_global_model_settings=bool(data.get('use_global_model_settings') or settings.pop('use_global_model_settings', False)),
+        )
+        saved['success'] = True
+        saved['account_id'] = s.account_id
+        saved['account_name'] = s.account_name
+        saved['knowledge'] = _ai_payload(s)['knowledge']
+        return jsonify(saved)
+
+    @app.route('/api/laike-accounts/knowledge', methods=['GET', 'POST'])
+    def laike_accounts_knowledge():
+        s = _acct()
+        if request.method == 'GET':
+            payload = _ai_payload(s)
+            body = dict(payload['knowledge'])
+            body.update({'success': True, 'account_id': s.account_id, 'account_name': s.account_name})
+            return jsonify(body)
+        data = request.get_json(silent=True) or {}
+        try:
+            saved = s.save_account_knowledge_base(
+                str(data.get('id') or ''), str(data.get('name') or ''), str(data.get('text') or ''),
+            )
+        except ValueError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+        return jsonify({
+            'success': True, 'account_id': s.account_id, 'account_name': s.account_name,
+            'knowledge_base': saved['knowledge_base'], **saved['knowledge'],
+        })
+
+    @app.route('/api/laike-accounts/knowledge/settings', methods=['POST'])
+    def laike_accounts_knowledge_settings():
+        s = _acct()
+        data = request.get_json(silent=True) or {}
+        requested = data.get('platform_assignments') if isinstance(data.get('platform_assignments'), dict) else {}
+        ids = requested.get('douyin_laike', requested.get(s.account_id, []))
+        knowledge = s.save_account_knowledge_settings(bool(data.get('enabled', True)), list(ids or []))
+        return jsonify({'success': True, 'account_id': s.account_id, 'account_name': s.account_name, **knowledge})
+
+    @app.route('/api/laike-accounts/settings', methods=['GET', 'POST'])
+    def laike_accounts_settings():
+        """兼容旧的「覆盖设置」接口：现在总是读写这个账号自己的配置。"""
+        s = _acct()
+        if request.method == 'GET':
+            return jsonify(_ai_payload(s))
+        data = request.get_json(silent=True) or {}
+        settings = data.get('settings') if isinstance(data.get('settings'), dict) else {}
+        ai_enabled = settings.get('ai_enabled') if 'ai_enabled' in settings else None
+        saved = s.save_account_settings(settings, ai_enabled=ai_enabled)
         saved['success'] = True
         saved['account_id'] = s.account_id
         return jsonify(saved)
@@ -1844,19 +2082,26 @@ def register_laike_routes(app) -> None:
         s._monitoring_wanted = False
         s._monitoring_since = 0
         s._persist_state()
-        return jsonify(s.stop_monitoring())
+        return jsonify(s.stop_monitoring('手动停止当前账号'))
 
     @app.route('/api/laike-logs')
     def laike_logs():
         if request.args.get('scope') == 'all':
             manager = get_manager()
             active = manager.active_system()
+            statuses = []
+            for row in manager.public_state().get('accounts') or []:
+                try:
+                    statuses.append(manager.system(row['id']).live_status())
+                except Exception:
+                    continue
             return jsonify({
                 'logs': manager.merged_logs(120),
                 'status': active.live_status() if active else {},
+                'statuses': statuses,
             })
         s = _acct()
-        return jsonify({'logs': s.logs[-100:], 'status': s.live_status()})
+        return jsonify({'logs': s.logs[-100:], 'status': s.live_status(), 'statuses': [s.live_status()]})
 
     @app.route('/api/laike-config', methods=['GET', 'POST'])
     def laike_config():

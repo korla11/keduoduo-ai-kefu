@@ -59,9 +59,9 @@
 <div class="pai-row"><button class="btn-primary" type="button" id="pai-api-save">保存接口设置</button><button class="btn-secondary" type="button" id="pai-test">测试连接</button><button class="btn-secondary" type="button" id="pai-models-btn">获取模型列表</button><button class="btn-secondary" type="button" id="pai-latency">延迟测速</button><span class="pai-res" id="pai-api-res"></span></div>
 <p class="help-text" style="margin-top:10px">已保存的 API Key 以掩码显示；不修改掩码时继续使用原密钥。</p>`);
 
-    const reply = section('ai-reply-panel', 'AI 回复设置', `
-<div class="pai-note gold">⚙️ 仅对「${NAME}」生效，其他平台各自独立设置。</div>
-<label class="pai-switch"><input type="checkbox" id="pai-plat-on"><span>在 ${NAME} 启用 AI 回复</span></label>
+    const reply = section('ai-reply-panel', isLaike ? 'AI 回复 / 话术' : 'AI 回复设置', `
+<div class="pai-note gold" id="pai-reply-note">${isLaike ? '每个来客账号单独一套人设、话术和策略。当前修改只写入选中的那个账号。' : `⚙️ 仅对「${NAME}」生效，其他平台各自独立设置。`}</div>
+<label class="pai-switch"><input type="checkbox" id="pai-plat-on"><span>${isLaike ? '在当前来客账号启用 AI 回复' : `在 ${NAME} 启用 AI 回复`}</span></label>
 <p class="help-text" id="pai-plat-hint" style="margin:6px 0 0"></p>
 <div class="pai-card"><h4>客服人设 / 回复提示词</h4><p class="sub">${isLaike ? 'AI 回复抖音来客客户时使用的系统人设与回复规则' : '可选：填写后会作为本平台 AI 回复的人设要求加入提示词；留空则保持原有回复逻辑'}</p>
 <textarea id="pai-persona" rows="8"></textarea>${isLaike ? `<h4 style="margin-top:12px">回复硬性规则（留资导向，不提问）</h4><p class="sub">追加在人设之后，普通回复和二次触达都会遵守；含问号的回复会自动重写为陈述句</p><textarea id="pai-rules" rows="6"></textarea>
@@ -94,17 +94,17 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
 <div class="pai-row"><button class="btn-primary" type="button" id="pai-reply-save">保存 ${NAME} AI 设置</button><span class="pai-res" id="pai-reply-res"></span></div>`);
 
     const kb = section('ai-kb-panel', '知识库', `
-<div class="pai-note gold">📚 知识库内容所有平台共用；下面勾选「${NAME}」要使用哪些知识库。</div>
-<label class="pai-switch"><input type="checkbox" id="pai-kb-on"><span>启用知识库（所有平台共用）</span></label>
+<div class="pai-note gold" id="pai-kb-note">${isLaike ? '知识库只属于当前选中的来客账号，不会和其他来客账号、抖音私信或小红书共用。' : `📚 知识库内容所有平台共用；下面勾选「${NAME}」要使用哪些知识库。`}</div>
+<label class="pai-switch"><input type="checkbox" id="pai-kb-on"><span>${isLaike ? '启用当前账号的知识库' : '启用知识库（所有平台共用）'}</span></label>
 <div class="pai-card"><h4>${NAME} 使用的知识库</h4><p class="sub">可选择一个或多个</p><div class="pai-kb" id="pai-kb-list">加载中…</div>
 <div class="pai-row"><button class="btn-primary" type="button" id="pai-kb-save">保存知识库选择</button><span class="pai-res" id="pai-kb-res"></span></div></div>
-<div class="pai-card"><h4>编辑知识库内容</h4><p class="sub">修改内容会影响所有使用该知识库的平台</p>
+<div class="pai-card"><h4>编辑知识库内容</h4><p class="sub">${isLaike ? '只影响当前这个来客账号' : '修改内容会影响所有使用该知识库的平台'}</p>
 <div class="pai-grid"><label class="f">选择<select id="pai-kb-sel"></select></label><label class="f">名称<input id="pai-kb-name" type="text" maxlength="100"></label>
 <label class="f wide">内容<textarea id="pai-kb-text" rows="10"></textarea></label></div>
 <div class="pai-row"><button class="btn-primary" type="button" id="pai-kb-text-save">保存知识库内容</button><span class="pai-res" id="pai-kb-text-res"></span></div></div>`);
 
     const ho = section('ai-handoff-panel', '人工待回', `
-<div class="pai-note gold">🙋 AI 无法可靠处理时暂停自动回复并加入人工待回列表（开关所有平台共用，列表仅显示 ${NAME}）。</div>
+<div class="pai-note gold">🙋 AI 无法可靠处理时暂停自动回复并加入人工待回列表（开关所有平台共用，${isLaike ? '列表只显示当前来客账号' : `列表仅显示 ${NAME}`}）。</div>
 <label class="pai-switch"><input type="checkbox" id="pai-ho-on"><span>启用人工待回</span></label>
 <div class="pai-row"><button class="btn-secondary" type="button" id="pai-ho-refresh">刷新列表</button><span class="pai-res" id="pai-ho-res"></span></div>
 <div id="pai-ho-list" style="margin-top:8px"></div>`);
@@ -114,7 +114,14 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
     [api, reply, kb, ho].forEach(s => content.insertBefore(s, logPanel || null));
 
     const res = (id, text, kind) => { const el = document.getElementById(id); el.textContent = text; el.className = 'pai-res' + (kind ? ' ' + kind : ''); };
+    function withAccount(url) {
+        if (!isLaike || url.indexOf('/api/laike-accounts/') !== 0) return url;
+        const id = window.laikeCurrentAccountId || '';
+        if (!id || /[?&]account_id=/.test(url)) return url;
+        return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'account_id=' + encodeURIComponent(id);
+    }
     async function j(url, opts) {
+        url = withAccount(url);
         const r = await fetch(url, opts && opts.body ? {method: opts.method || 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(opts.body)} : opts);
         let d = {}; try { d = await r.json(); } catch (_) {}
         if (!r.ok || d.success === false) throw new Error(d.error || `请求失败 (${r.status})`);
@@ -164,10 +171,22 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
     }
     let globalMs = {};
     document.querySelectorAll('input[name=pai-ms-mode]').forEach(r => r.addEventListener('change', () => { setMsMode(r.value); if (r.value === 'global') fillMs(globalMs); }));
+    function noteAccount(d) {
+        if (!isLaike) return;
+        const who = (d && d.account_name) || '当前账号';
+        const replyNote = document.getElementById('pai-reply-note');
+        if (replyNote) replyNote.textContent = `只对来客账号「${who}」生效。其他人设、话术、二次触达和黑名单都互不影响。AI 接口密钥仍是全局共用的。`;
+        const kbNote = document.getElementById('pai-kb-note');
+        if (kbNote) kbNote.textContent = `「${who}」自己的知识库。新建或修改不会改到其他来客账号，也不会改到抖音私信或小红书。`;
+    }
     async function loadReply(c) {
         globalMs = c.model_settings || {};
-        const d = await j(`/api/ai-platform-settings/${P}`);
+        const d = await j(isLaike ? '/api/laike-accounts/ai' : `/api/ai-platform-settings/${P}`);
         const s = d.settings || {};
+        if (isLaike) {
+            $('#pai-plat-on').checked = !!d.ai_enabled;
+            noteAccount(d);
+        }
         $('#pai-persona').value = s.persona || '';
         if (isLaike) {
             $('#pai-fu-on').checked = !!s.follow_up_enabled;
@@ -194,9 +213,6 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
     $('#pai-reply-save').onclick = async () => {
         res('pai-reply-res', '正在保存…');
         try {
-            const cur = await j('/api/ai-config');  // 取最新开关，避免覆盖其他平台
-            const platforms = {...(cur.platforms || {}), [P]: $('#pai-plat-on').checked};
-            await j('/api/ai-config', {body: {platforms}});
             const ps = {persona: $('#pai-persona').value};
             if (isLaike) Object.assign(ps, {follow_up_enabled: $('#pai-fu-on').checked, follow_up_delay: Number($('#pai-fu-delay').value) || 120, skip_if_lead: $('#pai-fu-skip').checked, lead_card_on_follow_up: $('#pai-fu-card').checked, follow_up_prompt: $('#pai-fu-prompt').value, blacklist: $('#pai-bl').value.split('\n').map(x => x.trim()).filter(Boolean), reply_rules: $('#pai-rules').value,
                 no_question_fallback: $('#pai-noq').value.trim(), block_enterprise: $('#pai-ent').checked, loop_guard: $('#pai-loop').checked,
@@ -205,6 +221,16 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
             if (document.querySelector('input[name=pai-ms-mode]:checked')?.value === 'own') {
                 ps.model_settings = {context_enabled: $('#pai-ctx').value === 'true', context_window: Number($('#pai-win').value) || 6000, auto_compress: $('#pai-comp').value === 'true', prohibited_words: $('#pai-words').value};
             } else ps.use_global_model_settings = true;
+            if (isLaike) {
+                ps.ai_enabled = $('#pai-plat-on').checked;
+                await j('/api/laike-accounts/ai', {body: ps});
+                await loadReply(await loadApi());
+                res('pai-reply-res', '已保存到当前来客账号', 'ok');
+                return;
+            }
+            const cur = await j('/api/ai-config');  // 取最新开关，避免覆盖其他平台
+            const platforms = {...(cur.platforms || {}), [P]: $('#pai-plat-on').checked};
+            await j('/api/ai-config', {body: {platforms}});
             await j(`/api/ai-platform-settings/${P}`, {body: ps});
             await loadReply(await loadApi());
             res('pai-reply-res', `已保存（仅 ${NAME}）`, 'ok');
@@ -224,17 +250,35 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
     }
     function fillKbEditor() { const b = KB.bases.find(x => x.id === $('#pai-kb-sel').value); $('#pai-kb-name').value = b ? b.name : ''; $('#pai-kb-text').value = b ? (b.text || '') : ''; }
     $('#pai-kb-sel').onchange = () => { $('#pai-kb-sel').dataset.touched = '1'; fillKbEditor(); };
-    async function loadKb() { KB = await j('/api/ai-knowledge'); KB.platform_assignments = KB.platform_assignments || {}; renderKb(); }
+    async function loadKb() {
+        KB = await j(isLaike ? '/api/laike-accounts/knowledge' : '/api/ai-knowledge');
+        KB.platform_assignments = KB.platform_assignments || {};
+        if (isLaike) noteAccount(KB);
+        renderKb();
+    }
     $('#pai-kb-save').onclick = async () => {
         const ids = [...document.querySelectorAll('#pai-kb-list input:checked')].map(i => i.value);
         res('pai-kb-res', '正在保存…');
-        try { await j('/api/ai-knowledge/settings', {body: {enabled: $('#pai-kb-on').checked, platform_assignments: {[P]: ids}}}); await loadKb(); res('pai-kb-res', `已保存（${NAME} 使用 ${ids.length} 个知识库）`, 'ok'); } catch (e) { res('pai-kb-res', e.message, 'err'); }
+        try {
+            const url = isLaike ? '/api/laike-accounts/knowledge/settings' : '/api/ai-knowledge/settings';
+            await j(url, {body: {enabled: $('#pai-kb-on').checked, platform_assignments: {[P]: ids}}});
+            await loadKb();
+            res('pai-kb-res', isLaike ? `已保存到当前来客账号（${ids.length} 个知识库）` : `已保存（${NAME} 使用 ${ids.length} 个知识库）`, 'ok');
+        } catch (e) { res('pai-kb-res', e.message, 'err'); }
     };
     $('#pai-kb-text-save').onclick = async () => {
         const id = $('#pai-kb-sel').value; const b = KB.bases.find(x => x.id === id);
         if (b && (b.documents || []).length && !b.text && !confirm('该知识库内容来自上传的文档，保存后将改为在线文本，继续？')) return;
         res('pai-kb-text-res', '正在保存…');
-        try { const d = await j('/api/ai-knowledge', {body: {id, name: $('#pai-kb-name').value.trim(), text: $('#pai-kb-text').value}}); $('#pai-kb-sel').dataset.touched = ''; await loadKb(); $('#pai-kb-sel').value = d.knowledge_base?.id || id; fillKbEditor(); res('pai-kb-text-res', '知识库内容已保存（所有平台共用）', 'ok'); } catch (e) { res('pai-kb-text-res', e.message, 'err'); }
+        try {
+            const url = isLaike ? '/api/laike-accounts/knowledge' : '/api/ai-knowledge';
+            const d = await j(url, {body: {id, name: $('#pai-kb-name').value.trim(), text: $('#pai-kb-text').value}});
+            $('#pai-kb-sel').dataset.touched = '';
+            await loadKb();
+            $('#pai-kb-sel').value = d.knowledge_base?.id || id;
+            fillKbEditor();
+            res('pai-kb-text-res', isLaike ? '知识库已保存到当前来客账号' : '知识库内容已保存（所有平台共用）', 'ok');
+        } catch (e) { res('pai-kb-text-res', e.message, 'err'); }
     };
 
     // 人工待回
@@ -244,7 +288,11 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
     async function loadHo() {
         try {
             const d = await j(`/api/ai-handoffs?platform=${encodeURIComponent(P)}`);
-            const items = d.items || [];
+            let items = d.items || [];
+            if (isLaike && window.laikeCurrentAccountId) {
+                const id = window.laikeCurrentAccountId;
+                items = items.filter(it => !it.laike_account_id || it.laike_account_id === id);
+            }
             $('#pai-ho-list').innerHTML = items.length ? items.map(it => `<div class="pai-ho" data-id="${esc(it.id)}"><div class="meta">${esc(it.sender_name || '客户')} · ${esc(it.reason || '')}</div><div>${esc(it.message_text || '')}</div>
 <div class="pai-row" style="margin-top:8px"><input type="text" placeholder="输入人工回复" style="flex:1;min-width:180px"><button class="btn-primary" type="button" data-act="reply">发送</button><button class="btn-secondary" type="button" data-act="dismiss">忽略</button></div></div>`).join('') : '<p class="help-text">暂无待处理消息</p>';
         } catch (e) { $('#pai-ho-list').innerHTML = `<p class="help-text">${esc(e.message)}</p>`; }
@@ -269,4 +317,5 @@ ${isLaike ? `<div class="pai-card"><h4>二次触达</h4><p class="sub">客户在
         loadHo();
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+    if (isLaike) window.addEventListener('laike-account-changed', () => { init(); });
 })();

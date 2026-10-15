@@ -368,11 +368,20 @@ class LaikeAccountManager:
             self._write_registry_locked()
         return self.public_account(account_id)
 
-    def create(self, name: str):
+    def create(self, name: str, copy_from: str = ''):
         self.load()
         cleaned = clean_account_name(name)
         if not cleaned:
             raise LaikeAccountError('请填写账号名称')
+        from laike_account_ai import AI_FILE, clone_document, empty_document, save_document
+        copied_name = ''
+        if str(copy_from or '').strip():
+            source = self.system(str(copy_from).strip())
+            source.ensure_account_ai()
+            ai_doc = clone_document(source.account_ai())
+            copied_name = source.account_name
+        else:
+            ai_doc = empty_document()
         with self._lock:
             account_id = 'acc_' + os.urandom(4).hex()
             record = {
@@ -403,11 +412,16 @@ class LaikeAccountManager:
                 'monitoring_since': 0,
                 'config': {'headless': headless, 'message_check_interval': interval},
             })
+            save_document(os.path.join(data_dir, AI_FILE), ai_doc)
             self._records.append(record)
             self._active_id = account_id
             self._write_registry_locked()
         system = self.system(account_id)
         system.add_log(f'已添加来客账号「{cleaned}」，请单独登录（不会影响其他账号）', 'info')
+        if copied_name:
+            system.add_log(f'已从「{copied_name}」复制 AI、知识库和话术，之后两边互不影响', 'info')
+        else:
+            system.add_log('这个账号的 AI、知识库和话术从空白开始，不会沿用其他账号或平台共用设置', 'info')
         return system
 
     def rename(self, account_id: str, name: str) -> Dict[str, Any]:
@@ -445,7 +459,7 @@ class LaikeAccountManager:
     def remove(self, account_id: str) -> Dict[str, Any]:
         system = self.system(account_id)
         if system.monitoring:
-            system.stop_monitoring()
+            system.stop_monitoring('账号已删除')
             thread = system.monitor_thread
             if thread is not None:
                 thread.join(timeout=20)
@@ -483,6 +497,7 @@ class LaikeAccountManager:
             'laike_greeted.json',
             'laike_leadcard_sent.json',
             'laike_settings_override.json',
+            'laike_account_ai.json',
             'laike_shot.png',
             'laike_qr.png',
             'laike_now.png',
@@ -613,6 +628,8 @@ class LaikeAccountManager:
             'biz_view_id': system.config.get('laike_biz_view_id', ''),
             'headless': system.config.get('headless', True),
             'active': system.account_id == self._active_id,
+            'ai_enabled': bool(system.account_ai().get('ai_enabled')),
+            'knowledge_count': len((system.account_ai().get('knowledge') or {}).get('bases') or []),
         }
 
     def public_state(self) -> Dict[str, Any]:
@@ -723,7 +740,7 @@ class LaikeAccountManager:
             system._monitoring_wanted = False
             system._monitoring_since = 0
             if system.monitoring:
-                system.stop_monitoring()
+                system.stop_monitoring('手动停止全部账号')
             system._persist_state()
         return {'success': True}
 
