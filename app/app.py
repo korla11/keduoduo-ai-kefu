@@ -3387,14 +3387,19 @@ def _dashboard_platform_statuses():
             elif key == 'xiaohongshu':
                 from xiaohongshu_reply_system import xiaohongshu_system as system
             else:
-                from douyin_laike_reply_system import get_laike_system
-                system = get_laike_system()
-            live = system.get_status() if hasattr(system, 'get_status') else {}
+                from douyin_laike_reply_system import laike_dashboard_status
+                live = laike_dashboard_status()
+                system = None
+            if system is not None:
+                live = system.get_status() if hasattr(system, 'get_status') else {}
+            account_count = int(live.get('account_count') or 0) if key == 'douyin_laike' else int(bool(live.get('logged_in')))
             assign(
                 key, bool(live.get('monitoring')), bool(live.get('logged_in', live.get('monitoring'))),
-                int(live.get('rules_count') or 0), int(bool(live.get('logged_in'))),
+                int(live.get('rules_count') or 0), account_count,
                 bool(live.get('monitor_starting')), bool(live.get('session_expired')),
             )
+            if key == 'douyin_laike' and live.get('account_summary'):
+                statuses[key]['message'] = live['account_summary']
         except Exception as exc:
             statuses[key] = {'state': 'unknown', 'state_label': '状态未知', 'message': str(exc), 'rules_count': 0, 'account_count': 0}
     return statuses
@@ -3909,8 +3914,8 @@ def _send_ai_handoff_reply(item, text):
         return bool(ok), '发送失败'
 
     if platform == 'douyin_laike':
-        from douyin_laike_reply_system import get_laike_system
-        r = get_laike_system().send_manual_reply(target.get('nickname') or item.get('sender_name'), text)
+        from douyin_laike_reply_system import laike_system_for_target
+        r = laike_system_for_target(target).send_manual_reply(target.get('nickname') or item.get('sender_name'), text)
         return bool(r.get('success')), r.get('error', '发送失败')
 
     from douyin_reply_system import douyin_system
