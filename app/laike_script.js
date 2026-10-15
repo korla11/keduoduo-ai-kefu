@@ -1,5 +1,27 @@
 // 抖音来客私信 - 前端控制脚本
 let laikeLogTimer = null;
+let laikeCurrentAccountId = '';
+let laikeAccounts = [];
+let laikeOverrideLoaded = false;
+
+function laikeFetch(url, options) {
+    options = options ? Object.assign({}, options) : {};
+    let finalUrl = url;
+    if (laikeCurrentAccountId && !/[?&]account_id=/.test(finalUrl)) {
+        finalUrl += (finalUrl.indexOf('?') >= 0 ? '&' : '?') + 'account_id=' + encodeURIComponent(laikeCurrentAccountId);
+    }
+    const method = String(options.method || 'GET').toUpperCase();
+    if (method !== 'GET' && options.body && laikeCurrentAccountId) {
+        try {
+            const obj = JSON.parse(options.body);
+            if (obj && typeof obj === 'object' && !Array.isArray(obj) && !obj.account_id) {
+                obj.account_id = laikeCurrentAccountId;
+                options.body = JSON.stringify(obj);
+            }
+        } catch (e) { /* 非 JSON 请求保持原样 */ }
+    }
+    return fetch(finalUrl, options);
+}
 
 function toggleLaikeTimingConfig() {
     const content = document.getElementById('laike-timing-config-content');
@@ -15,7 +37,7 @@ function toggleLaikeTimingConfig() {
 
 async function startLaikeMonitoring() {
     try {
-        const res = await fetch('/api/laike-start', {
+        const res = await laikeFetch('/api/laike-start', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({}),
@@ -35,7 +57,7 @@ async function startLaikeMonitoring() {
 
 async function stopLaikeMonitoring() {
     try {
-        const res = await fetch('/api/laike-stop', {method: 'POST'});
+        const res = await laikeFetch('/api/laike-stop', {method: 'POST'});
         const data = await res.json();
         if (data.success) {
             showToast('抖音来客监控已停止', 'info');
@@ -52,9 +74,13 @@ function updateLaikeButtons(running) {
     document.getElementById('stop-btn').disabled = !running;
     const dot = document.getElementById('status-dot');
     const status = document.getElementById('status');
+    const runningCount = laikeAccounts.filter(a => a.monitoring).length;
     if (running) {
         dot.style.color = '#52c41a';
-        status.textContent = '监控中';
+        status.textContent = laikeAccounts.length > 1 ? `${Math.max(runningCount, 1)} 个账号监控中` : '监控中';
+    } else if (runningCount > 0) {
+        dot.style.color = '#52c41a';
+        status.textContent = `${runningCount} 个账号监控中`;
     } else {
         dot.style.color = '#ccc';
         status.textContent = '未启动';
@@ -66,7 +92,7 @@ async function saveLaikeConfig() {
     const bizViewId = document.getElementById('laike-bizview').value.trim();
     const headless = document.getElementById('laike-headless').checked;
     try {
-        const res = await fetch('/api/laike-config', {
+        const res = await laikeFetch('/api/laike-config', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({groupid, biz_view_id: bizViewId, headless}),
@@ -81,7 +107,7 @@ async function saveLaikeConfig() {
 async function saveLaikeTimingConfig() {
     const interval = parseFloat(document.getElementById('laike-message-check-interval').value) || 3;
     try {
-        const res = await fetch('/api/laike-config', {
+        const res = await laikeFetch('/api/laike-config', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({message_check_interval: interval}),
@@ -95,7 +121,7 @@ async function saveLaikeTimingConfig() {
 
 async function loadLaikeConfig() {
     try {
-        const res = await fetch('/api/laike-config');
+        const res = await laikeFetch('/api/laike-config');
         const data = await res.json();
         if (data.groupid) document.getElementById('laike-groupid').value = data.groupid;
         if (data.biz_view_id) document.getElementById('laike-bizview').value = data.biz_view_id;
@@ -130,7 +156,7 @@ async function loadLaikeAccounts() {
     if (btn) { btn.disabled = true; btn.textContent = '正在读取...'; }
     showToast('正在探测账号列表，请稍候...', 'info');
     try {
-        const res = await fetch('/api/laike-list-accounts', {method: 'POST'});
+        const res = await laikeFetch('/api/laike-list-accounts', {method: 'POST'});
         const data = await res.json();
         if (data.accounts && data.accounts.length > 0) {
             laikeAccountsCache = data.accounts;
@@ -153,7 +179,7 @@ async function onLaikeAccountSelect() {
     if (isNaN(idx) || !laikeAccountsCache[idx]) return;
     const acc = laikeAccountsCache[idx];
     if (acc.name && !acc.current && !acc.name.startsWith('账号_')) {
-        const r = await (await fetch('/api/laike-select-store', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: acc.name})})).json();
+        const r = await (await laikeFetch('/api/laike-select-store', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: acc.name})})).json();
         showToast(r.success ? `已切换到门店：${acc.name}` : ('切换门店失败: ' + (r.error || '')), r.success ? 'success' : 'error');
         refreshLaikeAccountInfo();
         return;
@@ -170,7 +196,7 @@ async function onLaikeAccountSelect() {
     document.getElementById('laike-groupid').value = acc.groupid;
     if (acc.biz_view_id) document.getElementById('laike-bizview').value = acc.biz_view_id;
     try {
-        const res = await fetch('/api/laike-sync-account', {
+        const res = await laikeFetch('/api/laike-sync-account', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({groupid: acc.groupid, account_name: displayName, biz_view_id: acc.biz_view_id}),
@@ -206,7 +232,7 @@ async function syncLaikeAccount() {
     }
     showToast('正在保存账号...', 'info');
     try {
-        const res = await fetch('/api/laike-sync-account', {
+        const res = await laikeFetch('/api/laike-sync-account', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({groupid, account_name: accountName, biz_view_id: bizViewId}),
@@ -328,7 +354,7 @@ async function laikeLoginCall(url, body, method) {
     }
     const opt = method === 'GET' ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})};
     const run = (async () => {
-        const d = await (await fetch(url, opt)).json();
+        const d = await (await laikeFetch(url, opt)).json();
         if (isPoll && d.busy) return d;
         if (isPoll && laikeActionBusy) { if (d.screenshot) m.querySelector('#lk-shot').src = 'data:image/png;base64,' + d.screenshot; return d; }
         renderLaikeLogin(d);
@@ -382,6 +408,9 @@ function closeLaikeLoginModal() {
 
 function startLaikeLogin() {
     const m = ensureLaikeLoginModal();
+    const acc = laikeAccounts.find(a => a.id === laikeCurrentAccountId);
+    const title = m.querySelector('strong');
+    if (title) title.textContent = '登录抖音来客' + (acc && acc.name ? `（${acc.name}）` : '');
     m.style.display = 'flex';
     if (laikeLoginPollTimer) clearInterval(laikeLoginPollTimer);
     laikeLoginCall('/api/laike-login/open', {}).then(() => {
@@ -392,9 +421,208 @@ function startLaikeLogin() {
     });
 }
 
+function renderLaikeAccountList(data) {
+    const box = document.getElementById('laike-account-list');
+    if (!box) return;
+    const accounts = (data && data.accounts) || [];
+    laikeAccounts = accounts;
+    if (!laikeCurrentAccountId) {
+        laikeCurrentAccountId = (data && (data.account_id || data.active_id)) || (accounts[0] && accounts[0].id) || '';
+    }
+    const warn = document.getElementById('laike-memory-warning');
+    if (warn) {
+        const text = (data && data.memory_warning) || '';
+        warn.style.display = text ? 'block' : 'none';
+        warn.textContent = text;
+    }
+    const maxInput = document.getElementById('laike-max-browsers');
+    if (maxInput && document.activeElement !== maxInput && data && data.max_concurrent_browsers) {
+        maxInput.value = data.max_concurrent_browsers;
+    }
+    const usage = document.getElementById('laike-browser-usage');
+    if (usage && data) {
+        const ram = data.host_ram_mb ? `本机内存约 ${(data.host_ram_mb / 1024).toFixed(1)} GB。` : '';
+        usage.textContent = `${ram}当前打开 ${data.browsers_running || 0} / ${data.max_concurrent_browsers || 1} 个来客浏览器。停止监控后，空闲约 5 分钟会关掉该账号的浏览器（登录保留）。`;
+    }
+    if (!accounts.length) {
+        box.innerHTML = '<div style="padding:10px;background:#fafafa;border-radius:8px;color:#888">还没有来客账号。添加后会单独打开一个浏览器登录。</div>';
+        return;
+    }
+    box.innerHTML = accounts.map(acc => {
+        const selected = acc.id === laikeCurrentAccountId;
+        return `<div style="padding:10px 12px;border:1px solid ${selected ? '#1f7cff' : '#eee'};border-radius:8px;background:${selected ? '#f3f8ff' : '#fff'}">
+            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+                <strong>${escapeHtml(acc.name || acc.id)}</strong>
+                <span style="color:${acc.logged_in ? '#389e0d' : '#d48806'}">${acc.logged_in ? '已登录' : '未登录'}</span>
+                <span style="color:${acc.monitoring ? '#389e0d' : '#888'}">${acc.monitoring ? '监控中' : '未监控'}</span>
+                <span style="color:#888">${acc.browser_open ? '浏览器开着' : '浏览器已关闭'}</span>
+                ${acc.store_name ? `<span style="color:#555">${escapeHtml(acc.store_name)}</span>` : ''}
+                ${acc.groupid ? `<span style="color:#999;font-size:12px">groupid ${escapeHtml(acc.groupid)}</span>` : ''}
+            </div>
+            <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">
+                <button class="btn-secondary" type="button" onclick="laikeSelectAccount('${acc.id}')">${selected ? '当前账号' : '选中'}</button>
+                <button class="btn-secondary" type="button" onclick="laikeLoginAccount('${acc.id}')">登录</button>
+                <button class="btn-primary" type="button" onclick="laikeToggleAccount('${acc.id}', ${acc.monitoring ? 'false' : 'true'})">${acc.monitoring ? '停止监控' : '开始监控'}</button>
+                <button class="btn-secondary" type="button" onclick="laikeRenameAccount('${acc.id}')">改名</button>
+                <button class="btn-secondary" type="button" onclick="laikeRemoveAccount('${acc.id}')">删除</button>
+            </div>
+        </div>`;
+    }).join('');
+    const running = accounts.filter(a => a.monitoring).length;
+    const status = document.getElementById('status');
+    if (status && accounts.length > 1) {
+        status.textContent = running ? `${running} 个账号监控中` : '未启动';
+    }
+}
+
+async function laikeSelectAccount(id) {
+    laikeCurrentAccountId = id;
+    laikeLastLogKey = '';
+    try {
+        await laikeFetch('/api/laike-accounts/select', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id})});
+    } catch (e) {}
+    await refreshLaikeAccountInfo();
+    loadLaikeConfig();
+    laikeOverrideLoaded = false;
+    loadLaikeOverride().finally(() => { laikeOverrideLoaded = true; });
+    refreshLaikeLogs();
+}
+
+async function laikeAddAccount() {
+    const name = prompt('新来客账号的名称（例如门店名）：', '');
+    if (!name || !name.trim()) return;
+    try {
+        const data = await (await laikeFetch('/api/laike-accounts', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: name.trim()}),
+        })).json();
+        if (!data.success) { showToast(data.error || '添加失败', 'error'); return; }
+        laikeCurrentAccountId = (data.account && data.account.id) || '';
+        showToast('已添加，请为这个账号单独登录', 'success');
+        await refreshLaikeAccountInfo();
+        loadLaikeOverride();
+        startLaikeLogin();
+    } catch (e) {
+        showToast('添加失败: ' + e.message, 'error');
+    }
+}
+
+async function laikeRenameAccount(id) {
+    const current = (laikeAccounts.find(a => a.id === id) || {}).name || '';
+    const name = prompt('账号名称：', current);
+    if (!name || !name.trim()) return;
+    const data = await (await laikeFetch('/api/laike-accounts/rename', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id, name: name.trim()}),
+    })).json();
+    showToast(data.success ? '已改名' : (data.error || '改名失败'), data.success ? 'success' : 'error');
+    refreshLaikeAccountInfo();
+}
+
+async function laikeRemoveAccount(id) {
+    const current = (laikeAccounts.find(a => a.id === id) || {}).name || id;
+    if (!confirm(`删除来客账号「${current}」？\n\n会停止它的监控并清掉这个账号自己的登录数据，其他账号不受影响。`)) return;
+    const data = await (await laikeFetch('/api/laike-accounts/remove', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}),
+    })).json();
+    if (!data.success) { showToast(data.error || '删除失败', 'error'); return; }
+    if (laikeCurrentAccountId === id) laikeCurrentAccountId = data.active_id || '';
+    showToast('已删除该来客账号', 'info');
+    refreshLaikeAccountInfo();
+    loadLaikeConfig();
+    loadLaikeOverride();
+}
+
+async function laikeLoginAccount(id) {
+    await laikeSelectAccount(id);
+    startLaikeLogin();
+}
+
+async function laikeToggleAccount(id, start) {
+    laikeCurrentAccountId = id;
+    if (start) await startLaikeMonitoring();
+    else await stopLaikeMonitoring();
+    refreshLaikeAccountInfo();
+}
+
+async function startAllLaike() {
+    try {
+        const data = await (await laikeFetch('/api/laike-start-all', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})).json();
+        const failed = (data.results || []).filter(r => !r.success);
+        if (failed.length) showToast(failed.map(r => (r.name || r.id) + ': ' + (r.error || '失败')).join('；'), 'error');
+        else showToast(`已启动 ${data.started || 0} 个账号`, 'success');
+        refreshLaikeAccountInfo();
+        startLaikeLogPolling();
+    } catch (e) {
+        showToast('全部启动失败: ' + e.message, 'error');
+    }
+}
+
+async function stopAllLaike() {
+    try {
+        const data = await (await laikeFetch('/api/laike-stop-all', {method: 'POST'})).json();
+        showToast(data.success ? '已停止全部来客监控' : (data.error || '停止失败'), data.success ? 'info' : 'error');
+        updateLaikeButtons(false);
+        refreshLaikeAccountInfo();
+    } catch (e) {
+        showToast('停止失败: ' + e.message, 'error');
+    }
+}
+
+async function saveLaikeBrowserLimit() {
+    const value = parseInt(document.getElementById('laike-max-browsers').value, 10);
+    const data = await (await laikeFetch('/api/laike-accounts/limits', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({max_concurrent_browsers: value}),
+    })).json();
+    showToast(data.success ? `同时浏览器上限已设为 ${data.max_concurrent_browsers}` : '保存失败', data.success ? 'success' : 'error');
+    renderLaikeAccountList(data);
+}
+
+function toggleLaikeOverrideFields() {
+    const on = document.getElementById('laike-override-enabled').checked;
+    document.getElementById('laike-override-fields').style.display = on ? 'block' : 'none';
+}
+
+async function loadLaikeOverride() {
+    if (!laikeCurrentAccountId) return;
+    try {
+        const data = await (await laikeFetch('/api/laike-accounts/settings')).json();
+        const enabled = !!data.enabled;
+        document.getElementById('laike-override-enabled').checked = enabled;
+        toggleLaikeOverrideFields();
+        const src = enabled ? (data.settings || {}) : (data.effective || {});
+        document.getElementById('laike-override-ai').checked = enabled ? src.ai_enabled !== false : data.ai_enabled !== false;
+        document.getElementById('laike-override-persona').value = src.persona || '';
+        document.getElementById('laike-override-rules').value = src.reply_rules || '';
+        document.getElementById('laike-override-delay').value = src.follow_up_delay || 120;
+        document.getElementById('laike-override-follow').checked = src.follow_up_enabled !== false;
+        document.getElementById('laike-override-greet').value = src.silent_greet_text || '';
+    } catch (e) {}
+}
+
+async function saveLaikeOverride() {
+    const enabled = document.getElementById('laike-override-enabled').checked;
+    const settings = {
+        ai_enabled: document.getElementById('laike-override-ai').checked,
+        persona: document.getElementById('laike-override-persona').value,
+        reply_rules: document.getElementById('laike-override-rules').value,
+        follow_up_delay: parseInt(document.getElementById('laike-override-delay').value, 10) || 120,
+        follow_up_enabled: document.getElementById('laike-override-follow').checked,
+        silent_greet_text: document.getElementById('laike-override-greet').value,
+        silent_greet_enabled: true,
+    };
+    try {
+        const data = await (await laikeFetch('/api/laike-accounts/settings', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled, settings}),
+        })).json();
+        showToast(data.success ? (enabled ? '已保存此账号的独立回复设置' : '此账号改回共用设置') : '保存失败', data.success ? 'success' : 'error');
+    } catch (e) {
+        showToast('保存失败: ' + e.message, 'error');
+    }
+}
+
 async function refreshLaikeAccountInfo() {
     try {
-        const data = await (await fetch('/api/laike-status')).json();
+        const data = await (await laikeFetch('/api/laike-status')).json();
+        renderLaikeAccountList(data);
         const nickEl = document.getElementById('account-nickname');
         const uidEl = document.getElementById('account-uid');
         const statusEl = document.getElementById('login-status-text');
@@ -411,7 +639,10 @@ async function refreshLaikeAccountInfo() {
         }
         renderLaikeStores(data.stores || [], data.store_name || '');
         // 同步「系统控制」中的账号与 groupid / biz 字段
-        updateLaikeAccountDisplay({laike_account_name: data.store_name || '', groupid: data.groupid || ''});
+        const label = data.account_name
+            ? (data.store_name && data.store_name !== data.account_name ? `${data.account_name} · ${data.store_name}` : data.account_name)
+            : (data.store_name || '');
+        updateLaikeAccountDisplay({laike_account_name: label, groupid: data.groupid || ''});
         const g = document.getElementById('laike-groupid'), bz = document.getElementById('laike-bizview');
         if (g && document.activeElement !== g) g.value = data.groupid || '';
         if (bz && document.activeElement !== bz) bz.value = data.biz_view_id || '';
@@ -430,20 +661,20 @@ function renderLaikeStores(stores, current) {
 async function laikeSelectStore() {
     const sel = document.querySelector('#laike-store-picker select');
     if (!sel) return;
-    const d = await (await fetch('/api/laike-select-store', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: sel.value})})).json();
+    const d = await (await laikeFetch('/api/laike-select-store', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name: sel.value})})).json();
     showToast(d.success ? `已切换门店：${d.store_name || sel.value}` : ('切换失败: ' + d.error), d.success ? 'success' : 'error');
     refreshLaikeAccountInfo();
 }
 
 async function laikeDetectAccount() {
-    const d = await (await fetch('/api/laike-detect-account', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})).json();
+    const d = await (await laikeFetch('/api/laike-detect-account', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})).json();
     if (!d.success) showToast('识别失败: ' + d.error, 'error');
     refreshLaikeAccountInfo();
 }
 
 async function laikeSwitchAccount() {
-    if (!confirm('确定要切换抖音来客账号吗？\n\n将停止监控、退出当前账号并清空会话，随后需要重新登录。')) return;
-    const d = await (await fetch('/api/laike-switch-account', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})).json();
+    if (!confirm('确定退出当前这个来客账号的登录吗？\n\n只会清空这个账号自己的浏览器会话，其他账号保持原样。退出后需要重新登录此账号。')) return;
+    const d = await (await laikeFetch('/api/laike-switch-account', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})).json();
     if (!d.success) { showToast('切换失败: ' + (d.error || ''), 'error'); return; }
     if (typeof updateLaikeButtons === 'function') updateLaikeButtons(false);
     showToast('已退出旧账号，请登录新账号', 'info');
@@ -454,7 +685,9 @@ async function laikeSwitchAccount() {
 let laikeLastLogKey = '';
 async function refreshLaikeLogs() {
     try {
-        const res = await fetch('/api/laike-logs');
+        const allLogs = document.getElementById('laike-logs-all');
+        const logUrl = allLogs && allLogs.checked ? '/api/laike-logs?scope=all' : '/api/laike-logs';
+        const res = await laikeFetch(logUrl);
         const data = await res.json();
         const st = data.status || {};
         const line = document.getElementById('laike-live-status');
@@ -464,12 +697,12 @@ async function refreshLaikeLogs() {
         const container = document.getElementById('logs-container');
         if (!container) return;
         const logs = data.logs || [];
-        const key = logs.length + '|' + (logs.length ? logs[logs.length - 1].time + logs[logs.length - 1].message : '');
+        const key = logs.length + '|' + (logs.length ? logs[logs.length - 1].time + logs[logs.length - 1].message + (logs[logs.length - 1].account_id || '') : '');
         if (key === laikeLastLogKey) return;   // 无新日志不重绘
         laikeLastLogKey = key;
         const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 40;
         container.innerHTML = logs.map(l =>
-            `<div class="log-entry log-${l.level || 'info'}"><span class="log-time">${l.time}</span> ${escapeHtml(l.message)}</div>`
+            `<div class="log-entry log-${l.level || 'info'}"><span class="log-time">${l.time}</span> <span style="color:#1f7cff">${escapeHtml(l.account_name || '')}</span> ${escapeHtml(l.message)}</div>`
         ).join('');
         if (atBottom || !container.dataset.init) { container.scrollTop = container.scrollHeight; container.dataset.init = '1'; }
     } catch (e) {}
@@ -522,11 +755,22 @@ document.addEventListener('click', function(event) {
 
 // 页面加载时初始化
 document.addEventListener('DOMContentLoaded', () => {
+    laikeFetch('/api/laike-accounts').then(r => r.json()).then(data => {
+        if (data && data.active_id) laikeCurrentAccountId = data.active_id;
+        renderLaikeAccountList(data);
+        loadLaikeOverride().finally(() => { laikeOverrideLoaded = true; });
+    }).catch(() => {});
     loadLaikeConfig();
     refreshLaikeAccountInfo();
-    fetch('/api/laike-status').then(r => r.json()).then(d => {
+    laikeFetch('/api/laike-status').then(r => r.json()).then(d => {
+        if (d && d.account_id && !laikeCurrentAccountId) laikeCurrentAccountId = d.account_id;
+        renderLaikeAccountList(d);
         updateLaikeButtons(!!d.monitoring);
-        if (d.monitoring) startLaikeLogPolling();
+        if (!laikeOverrideLoaded && laikeCurrentAccountId) {
+            laikeOverrideLoaded = true;
+            loadLaikeOverride();
+        }
+        if ((d.accounts || []).some(a => a.monitoring) || d.monitoring) startLaikeLogPolling();
     }).catch(() => {});
     // 监听 tab 切换，切到日志 tab 时刷新
     const observer = new MutationObserver(() => {
@@ -543,7 +787,7 @@ window.addEventListener('hashchange', () => {
     if (location.hash.includes('tab=logs')) {
         refreshLaikeLogs();
         // 确保轮询在运行
-        fetch('/api/laike-status').then(r => r.json()).then(d => {
+        laikeFetch('/api/laike-status').then(r => r.json()).then(d => {
             if (d.monitoring && !laikeLogTimer) startLaikeLogPolling();
         }).catch(() => {});
     }

@@ -28,29 +28,84 @@ LAIKE_STATE_FILE = os.path.join(
 )
 
 
-def _load_laike_state() -> Dict[str, Any]:
+def _load_json_file(path: str) -> Dict[str, Any]:
     try:
-        if os.path.exists(LAIKE_STATE_FILE):
-            with open(LAIKE_STATE_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
         pass
     return {}
 
 
-def _save_laike_state(state: Dict[str, Any]) -> None:
+def _write_json_file(path: str, state: Dict[str, Any]) -> None:
     try:
-        with open(LAIKE_STATE_FILE, 'w', encoding='utf-8') as f:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
     except Exception:
         pass
 
 
+def _load_laike_state() -> Dict[str, Any]:
+    return _load_json_file(LAIKE_STATE_FILE)
+
+
+def _save_laike_state(state: Dict[str, Any]) -> None:
+    _write_json_file(LAIKE_STATE_FILE, state)
+
+
+class _NoLaikeAccount:
+    """账号被删光时的空对象，避免再去打开原来的浏览器 profile。"""
+
+    monitoring = False
+    logs: List[Dict[str, Any]] = []
+    config: Dict[str, Any] = {}
+    account_id = ''
+    account_name = ''
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            'monitoring': False, 'logged_in': False, 'rules_count': 0,
+            'monitor_starting': False, 'session_expired': False, 'account_count': 0,
+        }
+
+    def send_manual_reply(self, nickname: str, text: str) -> Dict[str, Any]:
+        return {'success': False, 'error': '没有可用的来客账号'}
+
+    def live_status(self) -> Dict[str, Any]:
+        return {'monitoring': False}
+
+
 def get_laike_system() -> 'DouyinLaikeReplySystem':
+    """当前选中的来客账号。多账号时不要用它代表全部账号。"""
     global laike_system
-    if laike_system is None:
-        laike_system = DouyinLaikeReplySystem()
-    return laike_system
+    from laike_accounts import get_manager
+    system = get_manager().active_system()
+    if system is not None:
+        laike_system = system
+        return system
+    return _NoLaikeAccount()  # type: ignore[return-value]
+
+
+def laike_dashboard_status() -> Dict[str, Any]:
+    from laike_accounts import get_manager
+    return get_manager().dashboard_status()
+
+
+def laike_system_for_target(target: Optional[Dict[str, Any]]) -> 'DouyinLaikeReplySystem':
+    from laike_accounts import LaikeAccountError, get_manager
+    account_id = str((target or {}).get('laike_account_id') or '')
+    try:
+        system = get_manager().resolve(account_id)
+    except LaikeAccountError:
+        system = None
+    return system or get_laike_system()
 
 # 复用主系统的 AI 能力（延迟导入，避免循环依赖）
 _ai = {}
@@ -75,17 +130,36 @@ class DouyinLaikeReplySystem:
 
     AI_PLATFORM_KEY = 'douyin_laike'
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        account_id: str = 'default',
+        account_name: str = '',
+        data_dir: Optional[str] = None,
+        legacy: bool = True,
+    ):
+        self.account_id = account_id or 'default'
+        self.account_name = account_name or '默认账号'
+        # 升级前的单账号继续用 laike:昵称 作为客户键，避免打散已有二次触达/留资记录
+        self.legacy = bool(legacy)
+        self.legacy_keys = bool(legacy) and self.account_id == 'default'
+        self.data_dir = os.path.abspath(data_dir or os.path.dirname(os.path.abspath(__file__)))
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.profile_dir = os.path.join(self.data_dir, DouyinLaikeWorker.PROFILE_DIR_NAME)
         self.config = config or {}
-        # 从持久化文件恢复状态
-        _saved = _load_laike_state()
+        # 从本账号目录恢复状态（老账号的 data_dir 就是原来的数据根目录）
+        _saved = self._load_state_file()
         if _saved.get('config'):
             # 合并保存的配置（groupid 等）
             for k, v in _saved['config'].items():
                 if k not in self.config:
                     self.config[k] = v
         self._laike_logged_in = bool(_saved.get('logged_in', False))
-        self._monitoring_wanted = bool(_saved.get('monitoring_enabled', False))
+        # account_monitoring_enabled 是本账号自己的开关；monitoring_enabled 可能被写成「任一账号」
+        _own = _saved.get('account_monitoring_enabled', None)
+        if _own is None:
+            _own = _saved.get('monitoring_enabled', False)
+        self._monitoring_wanted = bool(_own)
         self._monitoring_since = float(_saved.get('monitoring_since') or 0) if self._monitoring_wanted else 0
         self.monitoring = False
         self.monitor_thread: Optional[threading.Thread] = None
@@ -112,17 +186,110 @@ class DouyinLaikeReplySystem:
         self._user_contact_info: Dict[str, Dict[str, str]] = {}
         self._follow_up_thread: Optional[threading.Thread] = None
         self.logs: List[Dict[str, Any]] = []
-        self._storage_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            'douyin_laike_storage.json',
-        )
+        self._storage_path = self._file('douyin_laike_storage.json')
+
+    def _file(self, name: str) -> str:
+        return os.path.join(self.data_dir, name)
+
+    def _load_state_file(self) -> Dict[str, Any]:
+        return _load_json_file(self._file('douyin_laike_state.json'))
+
+    def user_key(self, nickname: str) -> str:
+        nick = (nickname or '').strip()
+        if self.legacy_keys:
+            return f'laike:{nick}'
+        return f'laike:{self.account_id}:{nick}'
+
+    def nick_from_key(self, user_key: str) -> str:
+        key = user_key or ''
+        prefix = 'laike:' if self.legacy_keys else f'laike:{self.account_id}:'
+        if key.startswith(prefix):
+            return key[len(prefix):]
+        if key.startswith('laike:'):
+            rest = key.split(':', 2)
+            return rest[-1] if len(rest) >= 2 else key
+        return key
+
+    def _read_override(self) -> Dict[str, Any]:
+        data = _load_json_file(self._file('laike_settings_override.json'))
+        return data if isinstance(data, dict) else {}
+
+    def _platform_settings(self) -> Dict[str, Any]:
+        """共享的抖音来客 AI 设置；本账号若打开覆盖，则只替换写明的字段。"""
+        from ai_reply_service import get_platform_settings, normalize_platform_settings
+        base = get_platform_settings(self.AI_PLATFORM_KEY)
+        override = self._read_override()
+        if not override.get('enabled'):
+            return base
+        patch = override.get('settings') if isinstance(override.get('settings'), dict) else {}
+        if not patch:
+            return base
+        merged = dict(base)
+        merged.update(patch)
+        return normalize_platform_settings(self.AI_PLATFORM_KEY, merged)
+
+    def _ai_enabled(self) -> bool:
+        override = self._read_override()
+        settings = override.get('settings') if isinstance(override.get('settings'), dict) else {}
+        if override.get('enabled') and 'ai_enabled' in settings:
+            return bool(settings.get('ai_enabled'))
+        return bool(_get_ai()['enabled'](self.AI_PLATFORM_KEY))
+
+    def set_settings_override(self, enabled: bool, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        allowed = {
+            'persona', 'reply_rules', 'follow_up_enabled', 'follow_up_delay', 'follow_up_prompt',
+            'silent_greet_enabled', 'silent_greet_text', 'silent_greet_delay',
+            'lead_card_on_follow_up', 'no_question_fallback', 'blacklist', 'ai_enabled',
+            'contact_thanks', 'after_lead_replies',
+        }
+        patch = {}
+        for key, value in (settings or {}).items():
+            if key in allowed:
+                patch[key] = value
+        payload = {'enabled': bool(enabled), 'settings': patch if enabled else {}}
+        _write_json_file(self._file('laike_settings_override.json'), payload)
+        return {'enabled': payload['enabled'], 'settings': patch, 'effective': self._platform_settings()}
+
+    def maybe_resume(self) -> None:
+        """服务重启：只恢复这个账号自己重启前开着的监控。"""
+        if not getattr(self, '_monitoring_wanted', False) or self.monitoring:
+            return
+        gate = getattr(self, '_browser_gate', None)
+        if gate:
+            err = gate(self)
+            if err:
+                self.add_log(err + '（未自动恢复监控）', 'warning')
+                return
+        ok = bool(getattr(self, '_laike_logged_in', False))
+        if not ok:
+            with self._browser_use_lock:
+                browser = self._ensure_browser()
+                browser.start_worker()
+                ok = bool(browser.check_session())
+            if ok:
+                self._laike_logged_in = True
+                self._persist_state()
+        if ok and not self.monitoring:
+            self.add_log(f'服务重启：账号「{self.account_name}」重启前监控处于运行状态，已自动恢复', 'info')
+            result = self.start_monitoring()
+            if not result.get('success') and not self.monitoring:
+                self.add_log('自动恢复监控失败: ' + str(result.get('error') or ''), 'warning')
+        elif not ok:
+            self.add_log(f'服务重启：账号「{self.account_name}」未登录，未自动恢复监控', 'warning')
+            release = getattr(self, '_browser_release', None)
+            if release:
+                release(self)
 
     def _persist_state(self) -> None:
-        """持久化登录态和配置。"""
-        _save_laike_state({
+        """持久化本账号的登录态和配置。account_monitoring_enabled 只表示本账号。"""
+        wanted = bool(getattr(self, '_monitoring_wanted', False))
+        _write_json_file(self._file('douyin_laike_state.json'), {
             'logged_in': bool(getattr(self, '_laike_logged_in', False)),
-            'monitoring_enabled': bool(getattr(self, '_monitoring_wanted', False)),
-            'monitoring_since': float(getattr(self, '_monitoring_since', 0) or 0) if getattr(self, '_monitoring_wanted', False) else 0,
+            'account_monitoring_enabled': wanted,
+            'monitoring_enabled': wanted,
+            'monitoring_since': float(getattr(self, '_monitoring_since', 0) or 0) if wanted else 0,
+            'account_id': self.account_id,
+            'account_name': self.account_name,
             'config': {
                 'laike_groupid': self.config.get('laike_groupid', ''),
                 'laike_biz_view_id': self.config.get('laike_biz_view_id', ''),
@@ -133,6 +300,12 @@ class DouyinLaikeReplySystem:
                 'message_check_interval': self.config.get('message_check_interval', 3.0),
             },
         })
+        hook = getattr(self, '_after_persist', None)
+        if hook:
+            try:
+                hook(self)
+            except Exception:
+                logger.warning('同步来客网关状态失败', exc_info=True)
 
     def get_status(self) -> Dict[str, Any]:
         """供仪表盘调用的状态。"""
@@ -142,6 +315,8 @@ class DouyinLaikeReplySystem:
             'rules_count': 0,
             'monitor_starting': False,
             'session_expired': False,
+            'account_id': self.account_id,
+            'account_name': self.account_name,
         }
 
     # ── 日志 ──
@@ -151,19 +326,20 @@ class DouyinLaikeReplySystem:
             'time': time.strftime('%Y-%m-%d %H:%M:%S'),
             'message': message,
             'level': level,
+            'account_id': self.account_id,
+            'account_name': self.account_name,
         }
         self.logs.append(entry)
         if len(self.logs) > 500:
             self.logs = self.logs[-500:]
-        logger.info('[laike] %s', message)
-        # 同步写文件，重启不丢
+        logger.info('[laike:%s] %s', self.account_name, message)
+        # 同步写本账号日志。文件行末标注账号名，正文格式保持不变，方便旧的回放解析。
         try:
-            log_file = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                'douyin_laike.log',
-            )
+            log_file = self._file('douyin_laike.log')
+            suffix = f'｜账号:{self.account_name}' if self.account_name else ''
+            line_message = message if (suffix and message.endswith(suffix)) else f'{message}{suffix}'
             with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"{entry['time']} [{level}] {message}\n")
+                f.write(f"{entry['time']} [{level}] {line_message}\n")
             if time.time() - getattr(self, '_last_log_trim', 0) > 3600:
                 self._last_log_trim = time.time()
                 self._trim_log_file(log_file)
@@ -218,6 +394,7 @@ class DouyinLaikeReplySystem:
             self._browser = DouyinLaikeWorker(
                 storage_path=self._storage_path,
                 headless=headless,
+                profile_dir=self.profile_dir,
             )
             self._browser.set_chat_params(
                 groupid=str(self.config.get('laike_groupid') or ''),
@@ -322,13 +499,13 @@ class DouyinLaikeReplySystem:
     # ── 二次触达待办持久化（重启不丢）──
 
     def _fu_file(self) -> str:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'laike_followup_state.json')
+        return self._file('laike_followup_state.json')
 
     def _fu_snapshot(self) -> Dict[str, Any]:
         keys = set(self._last_reply_time) | set(self._follow_up_sent) | set(self._last_incoming_time)
         return {k: {'last_reply': self._last_reply_time.get(k), 'last_incoming': self._last_incoming_time.get(k),
                     'follow_up_sent': self._follow_up_sent.get(k), 'has_lead': bool(self._has_left_contact.get(k)),
-                    'nickname': (self._user_contact_info.get(k) or {}).get('nickname') or k.replace('laike:', '')}
+                    'nickname': (self._user_contact_info.get(k) or {}).get('nickname') or self.nick_from_key(k)}
                 for k in keys}
 
     def _save_followup_state(self) -> None:
@@ -367,7 +544,7 @@ class DouyinLaikeReplySystem:
             restored += 1
         # 从日志重建（文件里没有的客户）
         cutoff = time.time() - 6 * 3600
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'douyin_laike.log')
+        log_path = self._file('douyin_laike.log')
         rec: Dict[str, Dict[str, float]] = {}
         try:
             with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -394,9 +571,9 @@ class DouyinLaikeReplySystem:
             pass
         for nick, r in rec.items():
             if r.get('lead'):
-                self._has_left_contact[f'laike:{nick}'] = True  # 历史消息里留过电话/微信
+                self._has_left_contact[self.user_key(nick)] = True  # 历史消息里留过电话/微信
         for nick, r in rec.items():
-            k = f'laike:{nick}'
+            k = self.user_key(nick)
             if k in saved or not r.get('reply'):
                 continue
             self._last_reply_time[k] = r['reply']
@@ -414,7 +591,7 @@ class DouyinLaikeReplySystem:
             if k not in self._follow_up_sent and (self._has_left_contact.get(k) or self._is_blocked(k)):
                 self._follow_up_sent[k] = time.time()
         if restored:
-            pend = [k.replace('laike:', '') for k in self._last_reply_time
+            pend = [self.nick_from_key(k) for k in self._last_reply_time
                     if k not in self._follow_up_sent and self._last_incoming_time.get(k, 0) <= self._last_reply_time[k]]
             self.add_log(f'已恢复 {restored} 个客户的二次触达状态（待触达: {", ".join(pend) or "无"}）', 'info')
         self._save_followup_state()
@@ -422,6 +599,11 @@ class DouyinLaikeReplySystem:
     def start_monitoring(self) -> Dict[str, Any]:
         if self.monitoring:
             return {'success': False, 'error': '已在监控中'}
+        gate = getattr(self, '_browser_gate', None)
+        if gate:
+            err = gate(self)
+            if err:
+                return {'success': False, 'error': err}
         try:
             self._restore_followup_state()
         except Exception as exc:
@@ -429,17 +611,20 @@ class DouyinLaikeReplySystem:
         self.monitoring = True
         self._monitor_stop.clear()
         self.monitor_thread = threading.Thread(
-            target=self._monitor_loop, daemon=True, name='laike-monitor',
+            target=self._monitor_loop, daemon=True, name=f'laike-monitor-{self.account_id}',
         )
         self.monitor_thread.start()
-        self.add_log('抖音来客私信监控已启动', 'info')
+        self.add_log(f'抖音来客私信监控已启动（{self.account_name}）', 'info')
+        release = getattr(self, '_browser_release', None)
+        if release:
+            release(self)
         return {'success': True}
 
     def stop_monitoring(self) -> Dict[str, Any]:
         self.monitoring = False
         self._monitor_stop.set()
         self._wake.set()
-        self.add_log('抖音来客私信监控已停止', 'info')
+        self.add_log(f'抖音来客私信监控已停止（{self.account_name}）', 'info')
         self._mon_stopped_at = time.time()
         self._start_browser_reaper()
         return {'success': True}
@@ -450,24 +635,14 @@ class DouyinLaikeReplySystem:
     MEM_SWAP_SOFT_MB = 1500
     IDLE_BROWSER_CLOSE_S = 300  # 停止监控 5 分钟后关闭浏览器（登录态保存在 profile，不会登出）
 
-    @staticmethod
-    def _chrome_rss_mb() -> int:
-        total = 0
-        try:
-            for pid in os.listdir('/proc'):
-                if not pid.isdigit():
-                    continue
-                try:
-                    with open(f'/proc/{pid}/cmdline', 'rb') as f:
-                        if b'douyin_laike_browser_profile' not in f.read():
-                            continue
-                    with open(f'/proc/{pid}/statm') as f:
-                        total += int(f.read().split()[1]) * os.sysconf('SC_PAGE_SIZE')
-                except (OSError, ValueError, IndexError):
-                    continue
-        except OSError:
-            return 0
-        return total // (1024 * 1024)
+    def _chrome_rss_mb(self) -> int:
+        """只统计这个账号自己的浏览器。Linux 读 /proc，Mac 用 ps，Windows 用 CIM；读不到则为 0。
+
+        阈值仍是单个浏览器：空闲时超过 650MB 提前清缓存，刷新后仍超过 800MB 就重启该浏览器。
+        多账号不会把几个浏览器的内存加在一起触发重启；同时开几个由 max_concurrent_browsers 限制。
+        """
+        from laike_accounts import chrome_profile_rss_mb
+        return chrome_profile_rss_mb(self.profile_dir)
 
     @staticmethod
     def _swap_used_mb() -> int:
@@ -524,7 +699,7 @@ class DouyinLaikeReplySystem:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning('来客浏览器空闲回收失败: %s', exc)
 
-        threading.Thread(target=_loop, daemon=True, name='laike-browser-reaper').start()
+        threading.Thread(target=_loop, daemon=True, name=f'laike-reaper-{self.account_id}').start()
 
     def apply_account_info(self, info: Dict[str, Any], source: str = '') -> bool:
         """用检测到的账号信息更新配置；groupid 变化时记录日志。返回是否有变化。"""
@@ -540,6 +715,12 @@ class DouyinLaikeReplySystem:
         self.config['laike_biz_view_id'] = str(info.get('biz_view_id') or '')
         if info.get('store_name'):
             self.config['laike_account_name'] = info['store_name']
+            adopt = getattr(self, '_on_store_name', None)
+            if adopt:
+                try:
+                    adopt(self, info['store_name'])
+                except Exception:
+                    logger.warning('更新来客账号显示名失败', exc_info=True)
         if info.get('user_name'):
             self.config['laike_user_name'] = info['user_name']
         if info.get('stores'):
@@ -594,6 +775,8 @@ class DouyinLaikeReplySystem:
         b = self._browser
         st = dict(self.live)
         st['monitoring'] = self.monitoring
+        st['account_id'] = self.account_id
+        st['account_name'] = self.account_name
         st['ws_connected'] = bool(b and b.ws_open > 0)
         st['ws_frames'] = b.ws_frames if b else 0
         st['ws_urls'] = list(b.ws_urls) if b else []
@@ -650,7 +833,7 @@ class DouyinLaikeReplySystem:
     _AD_TEXT_RE = re.compile(r'我是商家专属客服|商家专属客服|有需要随时联系|有需要随时找我|有任何需要随时|评价消息卡片|诚邀您评价|此消息由「|祝您生活愉快|祝你生活愉快|欢迎光临本店|感谢您的关注')
 
     def _blocked_file(self) -> str:
-        return os.path.join(os.path.dirname(self._fu_file()), 'laike_blocked.json')
+        return self._file('laike_blocked.json')
 
     def _blocked(self) -> Dict[str, Any]:
         if getattr(self, '_blocked_cache', None) is None:
@@ -662,10 +845,9 @@ class DouyinLaikeReplySystem:
         return self._blocked_cache
 
     def _is_blocked(self, user_key: str, nickname: str = '') -> str:
-        nick = (nickname or user_key.replace('laike:', '')).strip()
+        nick = (nickname or self.nick_from_key(user_key)).strip()
         try:
-            from ai_reply_service import get_platform_settings
-            if nick in (get_platform_settings(self.AI_PLATFORM_KEY).get('blacklist') or []):
+            if nick in (self._platform_settings().get('blacklist') or []):
                 return '黑名单'
         except Exception:
             pass
@@ -686,8 +868,12 @@ class DouyinLaikeReplySystem:
     def _handoff(self, user_key: str, nickname: str, text: str, reason: str) -> None:
         try:
             from ai_handoff_store import ai_handoff_store
-            ai_handoff_store.add(self.AI_PLATFORM_KEY, f'{user_key}|{abs(hash(text))}', nickname, user_key,
-                                 text or '(无文本)', reason, {'nickname': nickname})
+            ai_handoff_store.add(
+                self.AI_PLATFORM_KEY, f'{user_key}|{abs(hash(text))}',
+                f'{self.account_name} · {nickname}', user_key,
+                text or '(无文本)', reason,
+                {'nickname': nickname, 'laike_account_id': self.account_id, 'laike_account_name': self.account_name},
+            )
         except Exception as exc:
             logger.warning('加入人工待回失败: %s', exc)
         self.add_log(f'🧑‍💼 [{nickname}] 不自动回复，已加入人工待回：{reason}', 'warning')
@@ -723,8 +909,7 @@ class DouyinLaikeReplySystem:
         if r:
             return r
         try:
-            from ai_reply_service import get_platform_settings
-            _gs = get_platform_settings(self.AI_PLATFORM_KEY)
+            _gs = self._platform_settings()
         except Exception:
             _gs = {}
         _nk = _gs.get('ad_name_keywords')
@@ -756,7 +941,7 @@ class DouyinLaikeReplySystem:
                 b = self._ensure_browser()
                 ok = b.send_text(nickname, text)
             if ok:
-                self._sent_reply_texts.setdefault(f'laike:{nickname}', set()).add(text.strip())
+                self._sent_reply_texts.setdefault(self.user_key(nickname), set()).add(text.strip())
                 self.add_log(f'✅ [{nickname}] 人工回复已发送', 'success')
             return {'success': bool(ok), 'error': '' if ok else '发送失败'}
         except Exception as exc:
@@ -828,7 +1013,7 @@ class DouyinLaikeReplySystem:
     _PLATFORM_SELF_RE = re.compile(r'此消息由「|准备开店|已经有店|想咨询|合作吗|欢迎|您好|你好')
 
     def _greet_file(self) -> str:
-        return os.path.join(os.path.dirname(self._fu_file()), 'laike_greeted.json')
+        return self._file('laike_greeted.json')
 
     def _greeted(self) -> Dict[str, Any]:
         if getattr(self, '_greeted_cache', None) is None:
@@ -857,13 +1042,12 @@ class DouyinLaikeReplySystem:
             return True
         if m.is_self:
             # 我方侧但未带「此消息由」标记：只有欢迎语样式才算平台消息，否则视为人工已发
-            return bool(self._PLATFORM_SELF_RE.search(t)) and t not in self._sent_reply_texts.get(f'laike:{m.sender}', set())
+            return bool(self._PLATFORM_SELF_RE.search(t)) and t not in self._sent_reply_texts.get(self.user_key(m.sender), set())
         return False
 
     def _greet_settings(self):
         try:
-            from ai_reply_service import get_platform_settings
-            ps = get_platform_settings(self.AI_PLATFORM_KEY)
+            ps = self._platform_settings()
         except Exception:
             ps = {}
         return (ps.get('silent_greet_enabled', True), (ps.get('silent_greet_text') or '在的，亲').strip(),
@@ -1028,7 +1212,7 @@ class DouyinLaikeReplySystem:
                     # 基线：只记录“监控开始之前”的会话状态；开始后才到达的消息不计入基线
                     fresh = 0
                     for conv in conversations:
-                        key = f'laike:{(conv.nickname or "").strip()}'
+                        key = self.user_key(conv.nickname)
                         t = self._parse_conv_time(conv.last_time)
                         if conv.unread or (t is not None and t >= self._monitor_started_at - 90):
                             fresh += 1  # 不记基线 → 下面会被当作新会话检查
@@ -1047,14 +1231,14 @@ class DouyinLaikeReplySystem:
                         msgs = browser.read_messages(limit=10)
                     self._t_detect = time.time() - _t0
                     checked.add(open_nick)
-                    self._process_messages(f'laike:{open_nick}', open_nick, msgs, browser, allow_unseen=True)
+                    self._process_messages(self.user_key(open_nick), open_nick, msgs, browser, allow_unseen=True)
                 for conv in reversed(conversations):  # 等待最久的先处理
                     if not self.monitoring or self._monitor_stop.is_set():
                         break
                     nickname = (conv.nickname or '').strip()
                     if not nickname or '群' in nickname:
                         continue
-                    user_key = f'laike:{nickname}'
+                    user_key = self.user_key(nickname)
                     preview = conv.preview or ''
                     if conv.has_lead and not self._has_left_contact.get(user_key):
                         self._has_left_contact[user_key] = True
@@ -1093,7 +1277,7 @@ class DouyinLaikeReplySystem:
                 if open_nick and open_nick not in checked and self.monitoring:
                     with self._browser_use_lock:
                         msgs = browser.read_messages(limit=10)
-                    self._process_messages(f'laike:{open_nick}', open_nick, msgs, browser, allow_unseen=True)
+                    self._process_messages(self.user_key(open_nick), open_nick, msgs, browser, allow_unseen=True)
                 self._run_due_greets(browser)
 
             except Exception as exc:
@@ -1199,15 +1383,14 @@ class DouyinLaikeReplySystem:
     ) -> None:
         ai = _get_ai()
         # 抖音来客使用独立平台开关；未单独配置时 ai_reply_service 自动回退到抖音私信的开关
-        if not ai['enabled'](self.AI_PLATFORM_KEY):
+        if not self._ai_enabled():
             self.add_log(f'[{nickname}] 抖音来客 AI 未启用（AI回复 → 抖音来客），跳过', 'warning')
             return
         try:
             ctx = ai['build_ctx'](self.AI_PLATFORM_KEY, user_key)
         except Exception:
             ctx = ''
-        from ai_reply_service import get_platform_settings
-        _ps = get_platform_settings(self.AI_PLATFORM_KEY)
+        _ps = self._platform_settings()
         if self._has_left_contact.get(user_key) and not self._detect_contact_info(msg_text):
             # 已留资后继续咨询：只回固定短句（不调 AI、不引导留资、不提问、不触达）
             import random as _rnd
@@ -1293,15 +1476,14 @@ class DouyinLaikeReplySystem:
         if t is not None and t.is_alive():
             return
         self._follow_up_thread = threading.Thread(
-            target=self._follow_up_loop, daemon=True, name='laike-followup',
+            target=self._follow_up_loop, daemon=True, name=f'laike-followup-{self.account_id}',
         )
         self._follow_up_thread.start()
 
     def _follow_up_loop(self) -> None:
-        from ai_reply_service import get_platform_settings
         while self.monitoring and not self._monitor_stop.is_set():
             try:
-                fs = get_platform_settings(self.AI_PLATFORM_KEY)
+                fs = self._platform_settings()
                 if not fs.get('follow_up_enabled', True):
                     if self._monitor_stop.wait(timeout=10):
                         break
@@ -1334,7 +1516,7 @@ class DouyinLaikeReplySystem:
         if self._has_left_contact.get(user_key) or user_key in self._follow_up_sent:
             return
         contact = self._user_contact_info.get(user_key) or {}
-        nickname = contact.get('nickname') or user_key.replace('laike:', '')
+        nickname = contact.get('nickname') or self.nick_from_key(user_key)
         if not nickname:
             return
         self._follow_up_sent[user_key] = now
@@ -1363,7 +1545,7 @@ class DouyinLaikeReplySystem:
             self.add_log(f'⚠️ [{nickname}] 二次触达 AI 返回为空（第{attempt}次）', 'warning')
         if not follow_text:
             from ai_reply_service import LAIKE_FOLLOW_UP_FALLBACK
-            follow_text = ps.get('no_question_fallback') or LAIKE_FOLLOW_UP_FALLBACK
+            follow_text = self._platform_settings().get('no_question_fallback') or LAIKE_FOLLOW_UP_FALLBACK
             self.add_log(f'⚠️ [{nickname}] 二次触达改用兜底话术', 'warning')
         ok = False
         for attempt in (1, 2):
@@ -1411,8 +1593,7 @@ class DouyinLaikeReplySystem:
 
     def _gen_follow_up(self, user_key: str, transcript: str) -> str:
         ai = _get_ai()
-        from ai_reply_service import get_platform_settings
-        ps = get_platform_settings(self.AI_PLATFORM_KEY)
+        ps = self._platform_settings()
         instruction = (ps.get('persona') or '').strip() + '\n\n' + (ps.get('reply_rules') or '')
         instruction += '\n\n【本条任务：二次触达】' + (ps.get('follow_up_prompt') or '')
         if transcript:
@@ -1428,7 +1609,7 @@ class DouyinLaikeReplySystem:
                              instruction, platform=self.AI_PLATFORM_KEY)
         text = (decision.get('reply') or '').strip()
         if text and self._is_question(text):
-            text = self._fix_question(user_key.replace('laike:', ''), text, lambda: (ai['gen'](
+            text = self._fix_question(self.nick_from_key(user_key), text, lambda: (ai['gen'](
                 '【系统】请按要求写一句二次触达消息，只能用陈述句，绝对不能有问号或吗/呢等问句', instruction,
                 platform=self.AI_PLATFORM_KEY).get('reply') or '').strip())
         return text
@@ -1451,17 +1632,17 @@ class DouyinLaikeReplySystem:
         if again and not self._is_question(again):
             self.add_log(f'✏️ [{nickname}] 回复含提问，已重新生成为陈述句', 'info')
             return again
-        from ai_reply_service import LAIKE_NO_QUESTION_FALLBACK, get_platform_settings
+        from ai_reply_service import LAIKE_NO_QUESTION_FALLBACK
         self.add_log(f'✏️ [{nickname}] 回复含提问，已改用固定陈述句', 'info')
         try:
-            return get_platform_settings(self.AI_PLATFORM_KEY).get('no_question_fallback') or LAIKE_NO_QUESTION_FALLBACK
+            return self._platform_settings().get('no_question_fallback') or LAIKE_NO_QUESTION_FALLBACK
         except Exception:
             return LAIKE_NO_QUESTION_FALLBACK
 
     # ── 一键留资（随二次触达发送，每个客户仅一次，持久化）──
 
     def _lead_card_file(self) -> str:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'laike_leadcard_sent.json')
+        return self._file('laike_leadcard_sent.json')
 
     def _lead_card_sent(self) -> Dict[str, Any]:
         try:
@@ -1472,8 +1653,7 @@ class DouyinLaikeReplySystem:
             return {}
 
     def _maybe_send_lead_card(self, user_key: str, nickname: str) -> None:
-        from ai_reply_service import get_platform_settings
-        if not get_platform_settings(self.AI_PLATFORM_KEY).get('lead_card_on_follow_up', True):
+        if not self._platform_settings().get('lead_card_on_follow_up', True):
             return
         if self._is_blocked(user_key, nickname) or self._has_left_contact.get(user_key):
             return
@@ -1506,34 +1686,32 @@ class DouyinLaikeReplySystem:
 
 
 def register_laike_routes(app) -> None:
-    """注册抖音来客路由。"""
+    """注册抖音来客路由。未带 account_id 时操作当前选中的账号，兼容旧前端。"""
     from app_paths import get_static_root
+    from laike_accounts import LaikeAccountError, get_manager
+
+    @app.errorhandler(LaikeAccountError)
+    def _laike_account_error(exc):
+        return jsonify({'success': False, 'error': str(exc), 'accounts': []}), 404
+
+    def _acct():
+        data = request.get_json(silent=True) or {}
+        account_id = str(request.args.get('account_id') or data.get('account_id') or '').strip()
+        system = get_manager().resolve(account_id)
+        if system is None:
+            raise LaikeAccountError('请先添加来客账号')
+        return system
 
     def _auto_resume():
         import time as _t
         _t.sleep(8)
         try:
-            s = get_laike_system()
-            if not getattr(s, '_monitoring_wanted', False) or s.monitoring:
-                return
-            ok = getattr(s, '_laike_logged_in', False)
-            if not ok:
-                with s._browser_use_lock:
-                    b = s._ensure_browser()
-                    b.start_worker()
-                    ok = bool(b.check_session())
-                if ok:
-                    s._laike_logged_in = True
-                    s._persist_state()
-            if ok and not s.monitoring:
-                s.add_log('服务重启：重启前监控处于运行状态，已自动恢复监控', 'info')
-                s.start_monitoring()
-            elif not ok:
-                s.add_log('服务重启：来客未登录，未自动恢复监控（登录后请点击开始监控）', 'warning')
+            get_manager().resume_monitoring()
         except Exception as exc:  # noqa: BLE001
             print('laike auto-resume failed:', exc)
 
-    threading.Thread(target=_auto_resume, daemon=True, name='laike-auto-resume').start()
+    if os.environ.get('LAIKE_DISABLE_AUTO_RESUME') != '1':
+        threading.Thread(target=_auto_resume, daemon=True, name='laike-auto-resume').start()
 
     @app.route('/laike')
     def laike_page():
@@ -1543,7 +1721,7 @@ def register_laike_routes(app) -> None:
     def laike_screenshot():
         """返回最近一次监控截图（监控循环在 0 会话时自动保存）。"""
         import os
-        shot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'laike_shot.png')
+        shot_path = _acct()._file('laike_shot.png')
         if not os.path.exists(shot_path):
             return jsonify({'ok': False, 'error': '暂无截图，请先开始监控并等待一次扫描'})
         from flask import send_file
@@ -1551,7 +1729,8 @@ def register_laike_routes(app) -> None:
 
     @app.route('/api/laike-status')
     def laike_status():
-        s = get_laike_system()
+        s = _acct()
+        overview = get_manager().public_state()
         return jsonify({
             'monitoring': s.monitoring,
             'log_count': len(s.logs),
@@ -1561,11 +1740,92 @@ def register_laike_routes(app) -> None:
             'groupid': s.config.get('laike_groupid', ''),
             'biz_view_id': s.config.get('laike_biz_view_id', ''),
             'stores': s.config.get('laike_stores', []),
+            'account_id': s.account_id,
+            'account_name': s.account_name,
+            'accounts': overview.get('accounts') or [],
+            'active_id': overview.get('active_id') or '',
+            'max_concurrent_browsers': overview.get('max_concurrent_browsers'),
+            'browsers_running': overview.get('browsers_running'),
+            'host_ram_mb': overview.get('host_ram_mb'),
+            'memory_warning': overview.get('memory_warning') or '',
         })
+
+    @app.route('/api/laike-accounts', methods=['GET', 'POST'])
+    def laike_accounts_collection():
+        manager = get_manager()
+        if request.method == 'GET':
+            return jsonify(manager.public_state())
+        data = request.get_json(silent=True) or {}
+        try:
+            system = manager.create(str(data.get('name') or ''))
+        except LaikeAccountError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+        return jsonify({'success': True, 'account': manager.public_account(system.account_id), **manager.public_state()})
+
+    @app.route('/api/laike-accounts/select', methods=['POST'])
+    def laike_accounts_select():
+        data = request.get_json(silent=True) or {}
+        try:
+            account = get_manager().select(str(data.get('id') or data.get('account_id') or ''))
+        except LaikeAccountError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 404
+        return jsonify({'success': True, 'account': account})
+
+    @app.route('/api/laike-accounts/rename', methods=['POST'])
+    def laike_accounts_rename():
+        data = request.get_json(silent=True) or {}
+        try:
+            account = get_manager().rename(str(data.get('id') or data.get('account_id') or ''), str(data.get('name') or ''))
+        except LaikeAccountError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+        return jsonify({'success': True, 'account': account})
+
+    @app.route('/api/laike-accounts/remove', methods=['POST'])
+    def laike_accounts_remove():
+        data = request.get_json(silent=True) or {}
+        try:
+            result = get_manager().remove(str(data.get('id') or data.get('account_id') or ''))
+        except LaikeAccountError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+        return jsonify(result)
+
+    @app.route('/api/laike-accounts/limits', methods=['POST'])
+    def laike_accounts_limits():
+        data = request.get_json(silent=True) or {}
+        value = get_manager().set_max_browsers(data.get('max_concurrent_browsers'))
+        return jsonify({'success': True, 'max_concurrent_browsers': value, **get_manager().public_state()})
+
+    @app.route('/api/laike-accounts/settings', methods=['GET', 'POST'])
+    def laike_accounts_settings():
+        s = _acct()
+        if request.method == 'GET':
+            current = s._read_override()
+            return jsonify({
+                'success': True,
+                'account_id': s.account_id,
+                'enabled': bool(current.get('enabled')),
+                'ai_enabled': s._ai_enabled(),
+                'settings': current.get('settings') if isinstance(current.get('settings'), dict) else {},
+                'effective': s._platform_settings(),
+                'shared': not bool(current.get('enabled')),
+            })
+        data = request.get_json(silent=True) or {}
+        saved = s.set_settings_override(bool(data.get('enabled')), data.get('settings') if isinstance(data.get('settings'), dict) else {})
+        saved['success'] = True
+        saved['account_id'] = s.account_id
+        return jsonify(saved)
+
+    @app.route('/api/laike-start-all', methods=['POST'])
+    def laike_start_all():
+        return jsonify(get_manager().start_all())
+
+    @app.route('/api/laike-stop-all', methods=['POST'])
+    def laike_stop_all():
+        return jsonify(get_manager().stop_all())
 
     @app.route('/api/laike-start', methods=['POST'])
     def laike_start():
-        s = get_laike_system()
+        s = _acct()
         data = request.get_json(silent=True) or {}
         # 允许前端传入 groupid/biz_view_id
         if data.get('groupid'):
@@ -1573,13 +1833,14 @@ def register_laike_routes(app) -> None:
         if data.get('biz_view_id'):
             s.config['laike_biz_view_id'] = data['biz_view_id']
         result = s.start_monitoring()
-        s._monitoring_wanted = True
-        s._persist_state()
+        if result.get('success') or s.monitoring:
+            s._monitoring_wanted = True
+            s._persist_state()
         return jsonify(result)
 
     @app.route('/api/laike-stop', methods=['POST'])
     def laike_stop():
-        s = get_laike_system()
+        s = _acct()
         s._monitoring_wanted = False
         s._monitoring_since = 0
         s._persist_state()
@@ -1587,12 +1848,19 @@ def register_laike_routes(app) -> None:
 
     @app.route('/api/laike-logs')
     def laike_logs():
-        s = get_laike_system()
+        if request.args.get('scope') == 'all':
+            manager = get_manager()
+            active = manager.active_system()
+            return jsonify({
+                'logs': manager.merged_logs(120),
+                'status': active.live_status() if active else {},
+            })
+        s = _acct()
         return jsonify({'logs': s.logs[-100:], 'status': s.live_status()})
 
     @app.route('/api/laike-config', methods=['GET', 'POST'])
     def laike_config():
-        s = get_laike_system()
+        s = _acct()
         if request.method == 'GET':
             return jsonify({
                 'groupid': s.config.get('laike_groupid', ''),
@@ -1600,6 +1868,8 @@ def register_laike_routes(app) -> None:
                 'laike_account_name': s.config.get('laike_account_name', ''),
                 'headless': s.config.get('headless', True),
                 'message_check_interval': s.config.get('message_check_interval', 3.0),
+                'account_id': s.account_id,
+                'account_name': s.account_name,
             })
         data = request.get_json(silent=True) or {}
         if 'groupid' in data:
@@ -1622,28 +1892,35 @@ def register_laike_routes(app) -> None:
     # 把截图回传前端；遇到滑块/点选验证码时，前端可在截图上点击/拖动，坐标转发到浏览器。
 
     def _login_browser():
-        if s_monitoring():
+        s = _acct()
+        if s.monitoring:
             raise RuntimeError('监控运行中，请先停止监控再登录')
-        b = get_laike_system()._ensure_browser()
+        if not s._browser_alive():
+            gate = getattr(s, '_browser_gate', None)
+            if gate:
+                err = gate(s)
+                if err:
+                    raise RuntimeError(err)
+        b = s._ensure_browser()
         b.start_worker()
         return b
 
     def s_monitoring():
-        return bool(get_laike_system().monitoring)
+        return bool(_acct().monitoring)
 
     def _save_shot(res):
         import base64
         b64 = (res or {}).get('screenshot') or ''
         if b64:
             try:
-                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'laike_qr.png'), 'wb') as f:
+                with open(_acct()._file('laike_qr.png'), 'wb') as f:
                     f.write(base64.b64decode(b64))
             except Exception:
                 pass
 
     def _after_login(res):
         """登录成功：标记状态、解析 groupid、持久化。"""
-        s = get_laike_system()
+        s = _acct()
         if not (res or {}).get('logged_in'):
             return res
         was_logged = getattr(s, '_laike_logged_in', False)
@@ -1665,7 +1942,7 @@ def register_laike_routes(app) -> None:
         return res
 
     def _login_route(op, timeout=60, **kw):
-        s = get_laike_system()
+        s = _acct()
         if not s._login_lock.acquire(timeout=1 if op == 'login_snapshot' else 25):
             if op == 'login_snapshot':
                 return jsonify({'success': True, 'busy': True})
@@ -1677,11 +1954,16 @@ def register_laike_routes(app) -> None:
                 _save_shot(res)
                 res = _after_login(res)
             res['success'] = True
+            res['account_id'] = s.account_id
+            res['account_name'] = s.account_name
             return jsonify(res)
         except Exception as exc:
             return jsonify({'success': False, 'error': str(exc)})
         finally:
             s._login_lock.release()
+            release = getattr(s, '_browser_release', None)
+            if release:
+                release(s)
 
     @app.route('/api/laike-login/open', methods=['POST'])
     def laike_login_open():
@@ -1748,7 +2030,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-qr-image')
     def laike_qr_image():
         from flask import send_file
-        shot_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'laike_qr.png')
+        shot_path = _acct()._file('laike_qr.png')
         if not os.path.exists(shot_path):
             return jsonify({'success': False, 'error': '尚未生成登录截图'})
         return send_file(shot_path, mimetype='image/png')
@@ -1764,7 +2046,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-list-accounts', methods=['POST'])
     def laike_list_accounts():
         """读取当前登录账号及其门店列表（复用识别逻辑；监控中不跳转页面）。"""
-        s = get_laike_system()
+        s = _acct()
         if not getattr(s, '_laike_logged_in', False):
             return jsonify({'accounts': [], 'error': '尚未登录抖音来客，请先在「账号配置」中登录'})
         if not s._browser_use_lock.acquire(timeout=20):
@@ -1791,7 +2073,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-account-info')
     def laike_account_info():
         """获取当前浏览器中的商家账号信息。"""
-        s = get_laike_system()
+        s = _acct()
         try:
             browser = s._ensure_browser()
             try:
@@ -1812,7 +2094,7 @@ def register_laike_routes(app) -> None:
         简化版：用户手动在输入框填入 groupid，系统只做保存和显示。
         如需自动检测，需先通过「打开登录窗口」打开浏览器并进入会话页。
         """
-        s = get_laike_system()
+        s = _acct()
         try:
             data = request.get_json(silent=True) or {}
             # 优先用前端传来的 groupid（用户手动输入）
@@ -1852,7 +2134,7 @@ def register_laike_routes(app) -> None:
 
     @app.route('/api/laike-debug')
     def laike_debug():
-        s = get_laike_system()
+        s = _acct()
         try:
             with s._browser_use_lock:
                 b = s._ensure_browser()
@@ -1864,7 +2146,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-toolbar-probe')
     def laike_toolbar_probe():
         """只读：当前打开会话输入框上方工具栏（含「一键留资」）位置与文字，不点击。"""
-        s = get_laike_system()
+        s = _acct()
         try:
             with s._browser_use_lock:
                 b = s._ensure_browser()
@@ -1876,7 +2158,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-takeover-probe')
     def laike_takeover_probe():
         """只读：检查当前打开会话是否处于智能客服接待（不点击）。"""
-        s = get_laike_system()
+        s = _acct()
         try:
             with s._browser_use_lock:
                 b = s._ensure_browser()
@@ -1888,7 +2170,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-page-exec', methods=['POST'])
     def laike_page_exec():
         """调试（仅网关内部）：跳转/执行 JS/截图。"""
-        s = get_laike_system()
+        s = _acct()
         data = request.get_json(silent=True) or {}
         try:
             with s._browser_use_lock:
@@ -1901,7 +2183,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-peek')
     def laike_peek():
         """只读调试：列会话、打开第一个、读消息、检查输入框/发送按钮是否存在（不发送）。"""
-        s = get_laike_system()
+        s = _acct()
         try:
             with s._browser_use_lock:
                 b = s._ensure_browser()
@@ -1921,7 +2203,7 @@ def register_laike_routes(app) -> None:
 
     @app.route('/api/laike-switch-account', methods=['POST'])
     def laike_switch_account():
-        s = get_laike_system()
+        s = _acct()
         data = request.get_json(silent=True) or {}
         dry = bool(data.get('dry_run')) or request.args.get('dry_run') == '1'
         if not s._login_lock.acquire(timeout=5):
@@ -1936,7 +2218,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-detect-account', methods=['POST'])
     def laike_detect_account():
         """识别当前登录账号与门店列表。监控中只读取当前页面（不跳转）。"""
-        s = get_laike_system()
+        s = _acct()
         data = request.get_json(silent=True) or {}
         try:
             with s._browser_use_lock:
@@ -1954,7 +2236,7 @@ def register_laike_routes(app) -> None:
 
     @app.route('/api/laike-select-store', methods=['POST'])
     def laike_select_store():
-        s = get_laike_system()
+        s = _acct()
         name = ((request.get_json(silent=True) or {}).get('name') or '').strip()
         if not name:
             return jsonify({'success': False, 'error': '缺少门店名'})
@@ -1975,8 +2257,8 @@ def register_laike_routes(app) -> None:
     def laike_screenshot_now():
         """监控中也可用：对 worker 当前页面截图（只读）。"""
         from flask import send_file
-        s = get_laike_system()
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'laike_now.png')
+        s = _acct()
+        path = _acct()._file('laike_now.png')
         try:
             with s._browser_use_lock:
                 b = s._ensure_browser()
@@ -1989,7 +2271,7 @@ def register_laike_routes(app) -> None:
     @app.route('/api/laike-login-status')
     def laike_login_status():
         """检查来客登录状态（复用同一个无头浏览器，不另开实例以免 profile 冲突）。"""
-        s = get_laike_system()
+        s = _acct()
         if s.monitoring:
             return jsonify({'logged_in': bool(getattr(s, '_laike_logged_in', False)), 'monitoring': True})
         try:

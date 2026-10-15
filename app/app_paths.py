@@ -33,6 +33,8 @@ LEGACY_DATA_DIRS = (
     'weibo_browser_profile',
     'xianyu_browser_profile',
     'channels_browser_profile',
+    'douyin_laike_browser_profile',
+    'douyin_laike_accounts',
     'douyin_media',
 )
 
@@ -41,6 +43,13 @@ LEGACY_DATA_FILES = (
     'ai_conversations.sqlite3',
     'ai_handoffs.sqlite3',
     '.biligo_web_token',
+    'douyin_laike_state.json',
+    'douyin_laike_storage.json',
+    'douyin_laike_accounts.json',
+    'laike_followup_state.json',
+    'laike_blocked.json',
+    'laike_greeted.json',
+    'laike_leadcard_sent.json',
 )
 
 MIGRATION_MARKER = '.legacy_exe_dir_migrated'

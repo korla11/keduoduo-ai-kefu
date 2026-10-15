@@ -83,8 +83,9 @@ class DouyinLaikeWorker:
 
     PROFILE_DIR_NAME = 'douyin_laike_browser_profile'
 
-    def __init__(self, storage_path: str, headless: bool = True):
+    def __init__(self, storage_path: str, headless: bool = True, profile_dir: Optional[str] = None):
         self.storage_path = storage_path
+        self.profile_dir = os.path.abspath(profile_dir) if profile_dir else ''
         self.headless = headless
         self._abort = False
         self._queue: queue.Queue = queue.Queue()
@@ -489,10 +490,12 @@ class DouyinLaikeWorker:
             except Exception:
                 pass
         pw = self._playwright
-        profile_dir = os.path.join(
+        profile_dir = self.profile_dir or os.path.join(
             os.path.dirname(os.path.abspath(self.storage_path)),
             self.PROFILE_DIR_NAME,
         )
+        profile_dir = os.path.abspath(profile_dir)
+        self.profile_dir = profile_dir
         os.makedirs(profile_dir, exist_ok=True)
         self._context = pw.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
